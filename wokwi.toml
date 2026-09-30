@@ -1,0 +1,12 @@
+[wokwi]
+version = 1
+# Build with (sketch folder name must match the .ino, so compile a copy named sketch/):
+#   mkdir -p /tmp/sketch && cp sketch.ino tribe_logo.h /tmp/sketch/ &&
+#   arduino-cli compile --fqbn esp32:esp32:esp32s3 --output-dir build /tmp/sketch
+# Keep USB CDC off for the simulator: diagram.json wires the serial monitor to UART0.
+firmware = "build/sketch.ino.merged.bin"
+elf = "build/sketch.ino.elf"
+
+# Expose the simulated serial port so feeder.py can push live usage (its default --port):
+#   python3 feeder.py
+rfc2217ServerPort = 4000
