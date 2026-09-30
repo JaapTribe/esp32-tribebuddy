@@ -2,8 +2,9 @@
 // Boards: ESP32 "Cheap Yellow Display" (ESP32-2432S028R) or ESP32-S3 + ILI9341 module (the
 // Wokwi simulator). The pin profile is picked from the chip you compile for; see Pins below.
 // Reads newline-delimited JSON over serial and shows it on an ILI9341 2.8" TFT (portrait).
-// Touch: tap = next page (or dismiss a notification), hold = back to overview.
-// Pages: overview, one page per model, usage per day, usage per hour (today).
+// Touch: tap = next page (or dismiss a notification; on the recent page, open the one tapped),
+// hold = back to overview.
+// Pages: overview, one page per model, usage per day, usage per hour (today), recent notifications.
 //
 // Line protocol (one JSON object per line, all fields optional; feeder.py sends these):
 //   Overview: {"in":123456,"out":7890,"cr":2000000,"cw":150000,"cost":4.21,
@@ -24,7 +25,8 @@
 //             on tap. Up to 4 are queued.
 // Commands (plain text lines): "demo" toggles demo mode, "reset" clears all data,
 //           "flip" turns the display 180 degrees, "contrast" toggles the high-contrast
-//           palette, "gamma" cycles the panel's 4 gamma curves (all remembered across restarts).
+//           palette, "gamma" cycles the panel's 4 gamma curves (all remembered across restarts),
+//           "calibrate" runs the touch calibration again (XPT2046; also runs on first boot).
 //
 // Touch: XPT2046 (resistive) on the CYD; on the S3 profile FT6206 (capacitive, I2C; the
 // simulator) is tried first, then XPT2046 (the TPM408-2.8 module).
@@ -34,6 +36,7 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Fonts/FreeSans9pt7b.h>
+#include <Fonts/FreeSansBold9pt7b.h>
 #include <Adafruit_ILI9341.h>
 #include <Adafruit_FT6206.h>
 #include <ArduinoJson.h>
@@ -111,6 +114,14 @@ class Display : public Adafruit_ILI9341 {
 Display tft(&SPI, TFT_DC, TFT_CS, TFT_RST);
 Adafruit_FT6206 ctp;
 enum { TOUCH_NONE, TOUCH_FT6206, TOUCH_XPT2046 } touchType = TOUCH_NONE;
+// XPT2046 raw -> screen: raw values of the calibration crosses at x 20/220 and y 20/300.
+struct TouchCal {
+  bool ok = false;
+  bool swap = false;  // raw Y runs along screen x
+  bool flip = false;  // display was flipped while calibrating
+  int x0 = 0, x1 = 0, y0 = 0, y1 = 0;
+} touchCal;
+const int CAL_X0 = 20, CAL_X1 = 220, CAL_Y0 = 20, CAL_Y1 = 300;
 
 struct Usage {
   uint64_t in = 0, out = 0, cacheR = 0, cacheW = 0, limit = 0;
@@ -211,9 +222,10 @@ void setContrast(bool high) {
 uint64_t totalTokens() { return u.in + u.out + u.cacheW; }
 uint64_t modelTotal(const ModelUsage& m) { return m.in + m.out + m.cacheW; }
 
-int pageCount() { return 3 + nModels; }
+int pageCount() { return 4 + nModels; }
 int daysPage() { return 1 + nModels; }
 int hoursPage() { return 2 + nModels; }
+int recentPage() { return 3 + nModels; }
 
 void fmtTokens(uint64_t n, char* buf, size_t len) {
   double v = (double)n;
@@ -285,6 +297,7 @@ void drawStatus() {
   tft.setCursor(216 - 7 * 6, 10);
   tft.print(b);
 
+  if (page == recentPage() && nNotices == 0) drawRecentValues();  // tick the ages
   if (page == 0 && nNotices == 0) {
     char ago[24] = "";
     if (u.valid && !demo) snprintf(ago, sizeof(ago), "updated %lus ago", age);
@@ -520,13 +533,118 @@ void drawHoursValues() {
   drawBars(hours, 24, 12, 286, 170, 9, 7, nowHour);
 }
 
+int drawWrapped(int x, int y, int maxW, int maxLines, int lineH, const char* s,
+                const GFXfont* font = &FreeSans9pt7b);  // defined with the notification card
+
+// --- recent notifications ---
+// The last few notifications, newest first, kept after they're dismissed (RAM only: a restart
+// empties the list).
+struct Recent {
+  char from[25];  // header text, see noticeFrom
+  char title[40];
+  char body[160];
+  uint8_t prio;
+  unsigned long at;  // millis() when it came in
+};
+const int MAX_RECENT = 7;  // what fits on the page
+Recent recent[MAX_RECENT];
+int nRecent = 0;
+int openRecent = -1;  // the one shown full screen after a tap on its row, -1 = the list
+const int RC_Y = 52, RC_STEP = 38;  // first row, row height
+
+uint16_t prioColor(uint8_t prio) { return prio == PRIO_HIGH ? C_RED : prio == PRIO_LOW ? C_DIM : C_ACCENT; }
+
+// Row under screen y on the list, or -1 (the heading and empty space turn the page instead).
+int recentRowAt(int y) {
+  if (y < RC_Y - 4) return -1;
+  int i = (y - (RC_Y - 4)) / RC_STEP;
+  return i < nRecent ? i : -1;
+}
+
+void remember(const Notice& n) {
+  memmove(&recent[1], &recent[0], (MAX_RECENT - 1) * sizeof(Recent));
+  Recent& r = recent[0];
+  noticeFrom(n.app, n.src, r.from, sizeof(r.from));
+  strlcpy(r.title, n.title, sizeof(r.title));
+  strlcpy(r.body, n.body, sizeof(r.body));
+  r.prio = n.prio;
+  r.at = millis();
+  if (nRecent < MAX_RECENT) nRecent++;
+  if (openRecent >= 0 && ++openRecent >= MAX_RECENT) openRecent = -1;  // follow the open one down
+}
+
+// Full screen: header, title (bold), the whole message.
+void drawRecentDetail() {
+  const Recent& r = recent[openRecent];
+  tft.setTextSize(1);
+  tft.setTextColor(prioColor(r.prio), C_BG);
+  tft.setCursor(10, 38);
+  tft.print(r.from);
+  int y = 54;
+  tft.setTextColor(C_TEXT);
+  if (r.title[0]) y += 18 * drawWrapped(10, y, 220, 2, 18, r.title, &FreeSansBold9pt7b) + 6;
+  drawWrapped(10, y, 220, (298 - y) / 18, 18, r.body[0] ? r.body : "(no message)");
+  label(10, 308, "tap to go back");
+}
+
+// "now", "12m ago", "3h ago", "2d ago"
+void fmtAgo(unsigned long ms, char* buf, size_t len) {
+  unsigned long s = ms / 1000;
+  if (s < 60)         snprintf(buf, len, "now");
+  else if (s < 3600)  snprintf(buf, len, "%lum ago", s / 60);
+  else if (s < 86400) snprintf(buf, len, "%luh ago", s / 3600);
+  else                snprintf(buf, len, "%lud ago", s / 86400);
+}
+
+void drawRecentStatic() {
+  if (openRecent >= 0) { drawRecentDetail(); return; }
+  if (nRecent == 0) {
+    label(10, 38, "RECENT NOTIFICATIONS");
+    printAt(10, 150, 220, 16, 2, C_DIM, "Nothing yet");
+    label(10, 174, "notifications show up here");
+    return;
+  }
+  label(10, 38, "RECENT NOTIFICATIONS");
+  if (touchCal.ok || touchType == TOUCH_FT6206) label(230 - 11 * 6, 38, "tap to read");
+  for (int i = 0; i < nRecent; i++) {
+    const Recent& r = recent[i];
+    int y = RC_Y + i * RC_STEP;
+    uint16_t c = prioColor(r.prio);
+    tft.fillRect(10, y, 3, 28, c);  // priority stripe
+    tft.setTextSize(1);
+    tft.setTextColor(c, C_BG);
+    tft.setCursor(18, y);
+    tft.print(r.from);
+    tft.setTextColor(C_TEXT);
+    drawWrapped(18, y + 10, 212, 1, 18, r.title[0] ? r.title : r.body);  // one line, "..." when longer
+    if (i < nRecent - 1) tft.drawFastHLine(10, y + RC_STEP - 5, 220, C_PANEL);
+  }
+}
+
+// Only the ages change on their own; redrawn every second from drawStatus.
+void drawRecentValues() {
+  char b[12], r[12];
+  if (openRecent >= 0) {
+    fmtAgo(millis() - recent[openRecent].at, b, sizeof(b));
+    snprintf(r, sizeof(r), "%8s", b);
+    printAt(230 - 8 * 6, 38, 8 * 6, 8, 1, C_DIM, r);
+    return;
+  }
+  for (int i = 0; i < nRecent; i++) {
+    fmtAgo(millis() - recent[i].at, b, sizeof(b));
+    snprintf(r, sizeof(r), "%8s", b);  // right-aligned against the edge
+    printAt(230 - 8 * 6, RC_Y + i * RC_STEP, 8 * 6, 8, 1, C_DIM, r);
+  }
+}
+
 // What the current page shows, so updates for other pages don't redraw it.
-enum { SHOWS_OVERVIEW = 1, SHOWS_MODELS = 2, SHOWS_DAYS = 4, SHOWS_HOURS = 8 };
+enum { SHOWS_OVERVIEW = 1, SHOWS_MODELS = 2, SHOWS_DAYS = 4, SHOWS_HOURS = 8, SHOWS_RECENT = 16 };
 int pageShows() {
   if (page == 0)           return SHOWS_OVERVIEW;
   if (page <= nModels)     return SHOWS_MODELS;
   if (page == daysPage())  return SHOWS_DAYS;
-  return SHOWS_HOURS;
+  if (page == hoursPage()) return SHOWS_HOURS;
+  return SHOWS_RECENT;
 }
 
 bool pageHasData() {
@@ -545,6 +663,7 @@ void drawContent() {
     case SHOWS_MODELS:   drawModelValues(page - 1); break;
     case SHOWS_DAYS:     drawDaysValues(); break;
     case SHOWS_HOURS:    drawHoursValues(); break;
+    case SHOWS_RECENT:   drawRecentValues(); break;
   }
 }
 
@@ -557,6 +676,7 @@ void drawPage() {
     case SHOWS_MODELS:   drawModelStatic(); break;
     case SHOWS_DAYS:     drawDaysStatic(); break;
     case SHOWS_HOURS:    drawHoursStatic(); break;
+    case SHOWS_RECENT:   drawRecentStatic(); break;
   }
   drawnWithData = pageHasData();
   drawContent();
@@ -574,8 +694,8 @@ int textWidth(const char* s) {
 
 // Word-wraps s in FreeSans 9pt within maxW pixels, lineH apart from top y; the last line ends
 // in "..." when the text doesn't fit. Returns the number of lines drawn.
-int drawWrapped(int x, int y, int maxW, int maxLines, int lineH, const char* s) {
-  tft.setFont(&FreeSans9pt7b);
+int drawWrapped(int x, int y, int maxW, int maxLines, int lineH, const char* s, const GFXfont* font) {
+  tft.setFont(font);
   char line[64];
   int lines = 0;
   while (*s && lines < maxLines) {
@@ -631,6 +751,15 @@ int noticeBarFill() {
   return el >= ttl ? NB_W : (int)(el * NB_W / ttl);
 }
 
+// "GITHUB ACTIONS", "CLAUDE CODE", ...: the app name, else named after the source.
+void noticeFrom(const char* app, const char* src, char* buf, size_t len) {
+  const char* from = app[0] ? app
+                   : strcmp(src, "desktop") == 0 ? "Claude Desktop"
+                   : strcmp(src, "code") == 0 ? "Claude Code" : "Webhook";
+  strlcpy(buf, from, len);
+  for (char* c = buf; *c; c++) *c = toupper(*c);
+}
+
 void drawNotice() {
   const Notice& n = notices[0];
   const int x = NC_X, y = NC_Y, w = NC_W, h = NC_H;
@@ -641,11 +770,7 @@ void drawNotice() {
 
   // Header: the app name (webhooks) or where it came from, uppercase; priority badge on the right
   char head[25];
-  const char* from = n.app[0] ? n.app
-                   : strcmp(n.src, "desktop") == 0 ? "Claude Desktop"
-                   : strcmp(n.src, "code") == 0 ? "Claude Code" : "Webhook";
-  strlcpy(head, from, sizeof(head));  // 24 chars leave room for the badge
-  for (char* c = head; *c; c++) *c = toupper(*c);
+  noticeFrom(n.app, n.src, head, sizeof(head));  // 24 chars leave room for the badge
   tft.setTextSize(1);
   tft.setTextColor(C_ACCENT, C_CARD);
   tft.setCursor(x + 12, y + 12);
@@ -716,6 +841,7 @@ void pushNotice(const char* title, const char* body, const char* src, uint16_t t
     memmove(&notices[at + 1], &notices[at], (nNotices - at) * sizeof(Notice));
   }
   notices[at] = nw;
+  remember(nw);
   nNotices++;
   if (nNotices == 1) noticeShownAt = millis();  // queued ones start their timer when shown
   if (prio != PRIO_LOW) blinkUntil = millis() + (prio == PRIO_HIGH ? 3000 : 1200);
@@ -761,6 +887,7 @@ void refresh(int changed) {
 }
 
 void setPage(int p) {
+  openRecent = -1;
   int n = pageCount();
   page = ((p % n) + n) % n;
   drawPage();
@@ -785,6 +912,8 @@ void resetAll() {
   hoursValid = false;
   nowHour = -1;
   nNotices = 0;
+  nRecent = 0;
+  openRecent = -1;
   lim = PlanLimits();
 }
 
@@ -814,6 +943,11 @@ void handleLine(char* line) {
     }
     prefs.end();
     drawPage();
+    return;
+  }
+  if (strcmp(line, "calibrate") == 0) {
+    bool ok = calibrateTouch();
+    Serial.printf("{\"calibrate\":%s}\n", ok ? "true" : touchType == TOUCH_XPT2046 ? "false" : "\"n/a\"");
     return;
   }
   if (strcmp(line, "flip") == 0) {
@@ -940,8 +1074,9 @@ void readSerial() {
 }
 
 // ---------- touch ----------
-// Minimal XPT2046 reader: only the pressure (Z) is needed, so no calibration.
-// (The XPT2046_Touchscreen library can't be used next to Adafruit_FT6206: both define TS_Point.)
+// Minimal XPT2046 reader: pressure, plus the position mapped with a 3-point calibration kept in
+// flash. (The XPT2046_Touchscreen library can't be used next to Adafruit_FT6206: both define
+// TS_Point.)
 #if TOUCH_OWN_BUS
 SPIClass touchSPI(HSPI);
 SPIClass& tspi = touchSPI;
@@ -986,16 +1121,155 @@ bool touched() {
   }
 }
 
-// Tap = next page (or dismiss the notification on screen), hold >= 700 ms = back to overview. Position is ignored,
-// so no calibration or orientation mapping is needed.
+bool isFlipped() { return tft.getRotation() != DISPLAY_ROTATION; }
+
+// Raw 12-bit position averaged over 4 samples; false when not pressed (or lifted meanwhile).
+bool xptRaw(int& rx, int& ry) {
+  if (xptPressure() <= 400) return false;
+  long sx = 0, sy = 0;
+  tspi.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(TOUCH_CS, LOW);
+  xptRead(0x91);  // the first conversion after switching is noisy
+  for (int i = 0; i < 4; i++) { sx += xptRead(0xD1); sy += xptRead(0x91); }
+  xptRead(0xD0);  // power down, re-arms PENIRQ
+  digitalWrite(TOUCH_CS, HIGH);
+  tspi.endTransaction();
+  if (xptPressure() <= 400) return false;
+  rx = sx / 4;
+  ry = sy / 4;
+  return true;
+}
+
+// Screen position of the current touch; false when not touched or not calibrated.
+bool touchPoint(int& sx, int& sy) {
+  bool turned;  // measured in the other orientation than the screen is in now
+  if (touchType == TOUCH_FT6206) {
+    if (!ctp.touched()) return false;
+    TS_Point p = ctp.getPoint();
+    sx = 239 - p.x;  // FT6206 reports in panel coordinates, rotated 180 against rotation 0
+    sy = 319 - p.y;
+    turned = isFlipped();
+  } else if (touchType == TOUCH_XPT2046 && touchCal.ok) {
+    int rx, ry;
+    if (!xptRaw(rx, ry)) return false;
+    int a = touchCal.swap ? ry : rx, b = touchCal.swap ? rx : ry;
+    sx = CAL_X0 + (long)(a - touchCal.x0) * (CAL_X1 - CAL_X0) / (touchCal.x1 - touchCal.x0);
+    sy = CAL_Y0 + (long)(b - touchCal.y0) * (CAL_Y1 - CAL_Y0) / (touchCal.y1 - touchCal.y0);
+    turned = isFlipped() != touchCal.flip;
+  } else {
+    return false;
+  }
+  if (turned) { sx = 239 - sx; sy = 319 - sy; }
+  sx = constrain(sx, 0, 239);
+  sy = constrain(sy, 0, 319);
+  return true;
+}
+
+void loadTouchCal() {
+  Preferences prefs;
+  prefs.begin(PREFS_NS, true);
+  touchCal.ok = prefs.getBool("tc_ok", false);
+  touchCal.swap = prefs.getBool("tc_swap", false);
+  touchCal.flip = prefs.getBool("tc_flip", false);
+  touchCal.x0 = prefs.getInt("tc_x0", 0);
+  touchCal.x1 = prefs.getInt("tc_x1", 0);
+  touchCal.y0 = prefs.getInt("tc_y0", 0);
+  touchCal.y1 = prefs.getInt("tc_y1", 0);
+  prefs.end();
+  if (touchCal.x0 == touchCal.x1 || touchCal.y0 == touchCal.y1) touchCal.ok = false;
+}
+
+// Waits for a tap and returns its averaged raw position; false after 30 s without one.
+bool calTap(int& rx, int& ry) {
+  unsigned long start = millis();
+  while (xptPressure() > 400 && millis() - start < 30000) delay(10);  // let go first
+  while (millis() - start < 30000) {
+    int x, y;
+    if (xptRaw(x, y)) {
+      long ax = 0, ay = 0;
+      int n = 0;
+      unsigned long t = millis();
+      while (millis() - t < 300) {  // average while the finger rests on it
+        if (xptRaw(x, y)) { ax += x; ay += y; n++; }
+        delay(10);
+      }
+      while (xptPressure() > 400) delay(10);
+      if (n >= 3) { rx = ax / n; ry = ay / n; return true; }
+    }
+    delay(10);
+  }
+  return false;
+}
+
+// Three crosses: top left, top right, bottom right. Stored in flash; false when skipped/failed.
+bool calibrateTouch() {
+  if (touchType != TOUCH_XPT2046) return false;
+  static const int tx[3] = {CAL_X0, CAL_X1, CAL_X1}, ty[3] = {CAL_Y0, CAL_Y0, CAL_Y1};
+  int rx[3], ry[3];
+  bool ok = true;
+  for (int i = 0; i < 3 && ok; i++) {
+    tft.fillScreen(C_BG);
+    tft.setTextSize(2);
+    tft.setTextColor(C_TEXT, C_BG);
+    tft.setCursor(12, 140);
+    tft.print("Touch setup");
+    char b[40];
+    snprintf(b, sizeof(b), "Tap the centre of the cross (%d/3)", i + 1);
+    label(12, 166, b);
+    label(12, 180, "(skipped after 30 s)");
+    tft.drawFastHLine(tx[i] - 12, ty[i], 25, C_ACCENT);
+    tft.drawFastVLine(tx[i], ty[i] - 12, 25, C_ACCENT);
+    tft.drawCircle(tx[i], ty[i], 5, C_ACCENT);
+    ok = calTap(rx[i], ry[i]);
+  }
+  if (ok) {
+    // crosses 1 -> 2 differ only in screen x: the raw axis that moved most is screen x
+    bool swap = abs(ry[1] - ry[0]) > abs(rx[1] - rx[0]);
+    int x0 = swap ? ry[0] : rx[0], x1 = swap ? ry[1] : rx[1];
+    int y0 = swap ? rx[1] : ry[1], y1 = swap ? rx[2] : ry[2];  // crosses 2 -> 3: only screen y
+    ok = abs(x1 - x0) > 400 && abs(y1 - y0) > 400;  // too close together: a missed tap
+    if (ok) {
+      touchCal.ok = true;
+      touchCal.swap = swap;
+      touchCal.flip = isFlipped();
+      touchCal.x0 = x0; touchCal.x1 = x1; touchCal.y0 = y0; touchCal.y1 = y1;
+      Preferences prefs;
+      prefs.begin(PREFS_NS, false);
+      prefs.putBool("tc_ok", true);
+      prefs.putBool("tc_swap", swap);
+      prefs.putBool("tc_flip", touchCal.flip);
+      prefs.putInt("tc_x0", x0); prefs.putInt("tc_x1", x1);
+      prefs.putInt("tc_y0", y0); prefs.putInt("tc_y1", y1);
+      prefs.end();
+    }
+  }
+  drawPage();
+  return ok;
+}
+
+// A short tap: dismiss the card on screen, open/close a notification on the recent page, or turn
+// the page. x/y are -1 when the position isn't known (not calibrated).
+void onTap(int x, int y) {
+  if (nNotices > 0) { dismissNotice(false); return; }
+  if (page == recentPage()) {
+    if (openRecent >= 0) { openRecent = -1; drawPage(); return; }
+    int row = y >= 0 ? recentRowAt(y) : -1;
+    if (row >= 0) { openRecent = row; drawPage(); return; }
+  }
+  setPage(page + 1);
+}
+
+// Tap = onTap, hold >= 700 ms = back to overview. The position is read when the finger lands.
 void pollTouch() {
-  static bool down = false, held = false;
+  static bool down = false, held = false, hasPos = false;
+  static int px = -1, py = -1;
   static unsigned long since = 0, lastPoll = 0;
   if (touchType == TOUCH_NONE || millis() - lastPoll < 20) return;
   lastPoll = millis();
 
   bool t = touched();
-  if (t && !down) { down = true; held = false; since = millis(); }
+  if (t && !down) { down = true; held = false; since = millis(); hasPos = touchPoint(px, py); }
+  else if (t && down && !hasPos && millis() - since < 200) hasPos = touchPoint(px, py);
   else if (t && down && !held && millis() - since >= 700) {
     held = true;
     nNotices = 0;
@@ -1004,8 +1278,7 @@ void pollTouch() {
   else if (!t && down) {
     down = false;
     if (held || millis() - since < 30) return;
-    if (nNotices > 0) dismissNotice(false);
-    else setPage(page + 1);
+    onTap(hasPos ? px : -1, hasPos ? py : -1);
   }
 }
 
@@ -1107,11 +1380,16 @@ void setup() {
 
   drawSplash();
   initTouch();
+  loadTouchCal();
   delay(1500);
   drawPage();
   Serial.printf("{\"ready\":true,\"board\":\"%s\",\"display\":\"%04X\",\"touch\":\"%s\","
                 "\"hint\":\"send JSON lines or type demo\"}\n", BOARD_NAME, dispId,
                 touchType == TOUCH_FT6206 ? "ft6206" : touchType == TOUCH_XPT2046 ? "xpt2046" : "none");
+  // Tapping a notification needs the touch position: calibrate once (skipped after 30 s,
+  // asked again next boot; "calibrate" redoes it).
+  if (touchType == TOUCH_XPT2046 && !touchCal.ok)
+    Serial.printf("{\"calibrate\":%s}\n", calibrateTouch() ? "true" : "false");
 }
 
 void loop() {

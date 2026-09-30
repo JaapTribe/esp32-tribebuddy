@@ -191,9 +191,11 @@ the same numbers as `/usage` in Claude Code, with a countdown to each reset.
 
 ## Using the display
 
-- **Tap**: next page, or dismiss a notification.
+- **Tap**: next page, or dismiss a notification. On the recent notifications page, tap a row to
+  read the whole message, and tap again to go back; tap the heading to go to the next page.
 - **Hold** (0.7 s or longer): back to the overview.
-- Pages: overview, one per model, last 14 days, today by hour.
+- Pages: overview, one per model, last 14 days, today by hour, recent notifications (the
+  last 7, newest first, with how long ago; cleared when the board restarts).
 
 Board commands, sent with `python3 feeder.py send <command> --port auto` (stop the service first)
 or typed in a serial monitor:
@@ -205,8 +207,15 @@ or typed in a serial monitor:
 | `flip`     | rotate the picture 180°                                  |
 | `contrast` | switch between high-contrast and the standard palette    |
 | `gamma`    | cycle the panel's four gamma curves                      |
+| `calibrate`| redo the touch calibration (tap three crosses)           |
 
 `flip`, `contrast` and `gamma` are remembered across restarts.
+
+**Touch calibration** (Cheap Yellow Display): the first time the board starts it asks you to tap
+three crosses, so it knows where you tap. It's stored in flash. If you skip it (30 seconds per
+cross) it asks again at the next start; until then taps only turn pages. Redo it with
+`python3 feeder.py send calibrate --port auto` (stop the service first) if taps land on the
+wrong row.
 
 ## Notes
 

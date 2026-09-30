@@ -25,7 +25,7 @@ Notifications, shown as a card on the display until tapped:
     python3 feeder.py --port /dev/cu.usbmodem1101 --limit 5000000
     python3 feeder.py --dry-run --once         # print the lines instead of sending
     python3 feeder.py uninstall-hooks          # remove the hooks again
-    python3 feeder.py send gamma --port ...    # send a command: demo, reset, flip, contrast, gamma
+    python3 feeder.py send gamma --port ...    # send a command: demo, reset, flip, contrast, gamma, calibrate
     python3 feeder.py --port auto              # find the board by its USB chip, reconnect on replug
     python3 feeder.py install-service          # start at login (macOS LaunchAgent / systemd --user)
     python3 feeder.py uninstall-service
@@ -902,7 +902,7 @@ def uninstall_service():
 
 def send_command(argv):
     ap = argparse.ArgumentParser(prog="feeder.py send")
-    ap.add_argument("command", choices=["demo", "reset", "flip", "contrast", "gamma"])
+    ap.add_argument("command", choices=["demo", "reset", "flip", "contrast", "gamma", "calibrate"])
     ap.add_argument("--port", default=SIM_PORT, help="serial port, 'auto', or pyserial URL")
     ap.add_argument("--baud", type=int, default=115200)
     args = ap.parse_args(argv)
@@ -912,7 +912,9 @@ def send_command(argv):
     port = open_port(dev, args.baud)
     port.write(args.command.encode() + b"\n")
     port.flush()
-    end = time.monotonic() + 2
+    if args.command == "calibrate":
+        print("Tap the crosses on the display...")
+    end = time.monotonic() + (100 if args.command == "calibrate" else 2)  # 3 taps, 30 s each
     while time.monotonic() < end:  # print the board's reply, e.g. {"gamma":2}
         reply = port.readline().decode(errors="replace").strip()
         if reply.startswith("{") and '"ready"' not in reply:
