@@ -2,7 +2,8 @@
 
 A desk display for Claude usage. An ESP32 with a 2.8" touchscreen shows today's tokens and
 estimated cost, per-model, per-day and per-hour charts, your plan limits (5-hour and weekly),
-and a notification card when Claude Code or Claude Desktop needs you.
+and a notification card when Claude Code or Claude Desktop needs you — or when any other app
+or script posts to its webhook.
 
 The board has no network connection: `feeder.py` runs on your computer, reads Claude Code's
 local logs, and sends the numbers over USB serial.
@@ -107,6 +108,74 @@ Running sessions pick them up after `/hooks` or a restart. The hooks point to th
 Full Disk Access (System Settings > Privacy & Security) for the app running the feeder: your
 terminal, or for the service the Python that `install-service` prints. Restart the feeder after
 granting it.
+
+**Webhook** — anything that can make an HTTP request can put a card on the display: CI,
+monitoring, home automation, a cron script. The feeder listens on `http://localhost:8787/notify`.
+
+```sh
+curl -d "Backup finished" "http://localhost:8787/notify?app=Backup&priority=low"
+
+curl -H "Content-Type: application/json" http://localhost:8787/notify -d '{
+  "app": "GitHub Actions",
+  "title": "Deploy failed",
+  "message": "tribe-website: build failed on main",
+  "priority": "high"
+}'
+```
+
+| Field      | Also accepted as                      | Shown as                                   |
+|------------|---------------------------------------|--------------------------------------------|
+| `app`      | `source`, `src`, `sender`, `app_name` | card header (default "Webhook")            |
+| `message`  | `body`, `text`, `msg`, `content`      | card text (required, unless a title is set)|
+| `title`    | `subject`                             | large line above the text (optional)       |
+| `priority` | `prio`, `level`, `severity`           | `low`, `normal` (default) or `high`        |
+| `ttl`      |                                       | seconds on screen, 0 = until tapped        |
+
+- Send JSON, form fields, or plain text (the text becomes the message); query parameters work
+  for every field.
+- Priority also takes 1–5 (1–2 low, 3 normal, 4–5 high) and words like `urgent`, `critical`,
+  `error` (high) or `info`, `debug` (low).
+- **High**: red border, longer blink, shown before other waiting cards.
+  **Low**: dim border, no blink.
+- Up to 4 cards wait on the board; texts longer than the card are cut off with "...".
+
+By default only this computer can post to it. To accept posts from your network, set a token:
+
+```sh
+python3 feeder.py --port auto --webhook-host 0.0.0.0 --webhook-token <secret>
+curl -H "Authorization: Bearer <secret>" -d "Hello" http://<your-mac>:8787/notify
+```
+
+The token can also be sent as `X-Token: <secret>` or `?token=<secret>`, or set with the
+`TRIBEBUDDY_WEBHOOK_TOKEN` environment variable. Requests from web browsers (with an `Origin`
+header) are always refused, so websites you visit can't post to it. Use `--webhook-port` to
+change the port, `--webhook-port 0` to turn the webhook off. For the service, pass the same
+options to `install-service`.
+
+**From the internet (Jira, Bitbucket, …)** — cloud services can't reach your computer, so the
+feeder can start an [ngrok](https://ngrok.com) tunnel in front of the webhook. Set up once:
+
+1. `brew install ngrok` and create a free account at [dashboard.ngrok.com](https://dashboard.ngrok.com/signup).
+2. `ngrok config add-authtoken <token>` (the token is on the dashboard under "Your Authtoken").
+3. Look up your domain on the dashboard (Universal Gateway > Domains). Free accounts get one
+   fixed domain assigned, like `discharge-gimmick-lard.ngrok-free.dev`; you can't pick the
+   name (that's a paid feature, `ERR_NGROK_313`).
+
+Then run the feeder with a token (it refuses to open a tunnel without one, and suggests a
+random one):
+
+```sh
+python3 feeder.py --port auto --tunnel ngrok --tunnel-domain <your-domain>.ngrok-free.dev \
+  --webhook-token <secret>
+```
+
+The log shows `tunnel up: https://<your-domain>.ngrok-free.dev/notify`. Give services that URL and
+the token: as an `Authorization: Bearer <secret>` header where they allow custom headers (Jira
+Automation's "Send web request"), otherwise as `?token=<secret>` in the URL. With a token set,
+local posts need it too. For the service:
+`python3 feeder.py install-service --tunnel ngrok --tunnel-domain … --webhook-token …`.
+If ngrok stops (network change, sleep) the feeder restarts it: after 10 seconds, backing off
+to every 5 minutes while it keeps failing.
 
 ## Plan limits
 

@@ -12,11 +12,16 @@
 //   Days:     {"days":[{"d":"09-24","tok":123456,"cost":1.2}, ...]}   oldest first, last = today
 //   Hours:    {"hours":[0,0,1200, ...24 values],"now":14}              index = local hour
 //   Limits:   {"limits":{"5h":42,"5h_in":4320,"7d":61,"7d_in":190000}}  plan usage in percent and
-//             seconds until each window resets (counted down here). Replaces the "limit" bar.
-//   Notify:   {"notify":{"title":"TribeBuddy","body":"Needs permission: Bash","src":"code"}}
-//             src: "code" (Claude Code hook) or "desktop" (Claude Desktop / Cowork). Shown as a
-//             card with a progress bar; it closes when the bar is full (optional "ttl" in seconds,
-//             default 15, 0 = until tapped) or on tap. Up to 4 are queued.
+//             seconds until each window resets (counted down here; 0 = unknown). Replaces the
+//             "limit" bar. Greyed out after 10 minutes without an update, dropped after 30.
+//   Notify:   {"notify":{"title":"TribeBuddy","body":"Needs permission: Bash","src":"code",
+//                        "app":"GitHub","prio":"high"}}
+//             src: "code" (Claude Code hook), "desktop" (Claude Desktop / Cowork) or "hook"
+//             (webhook). app: shown as the card's header instead of the src name. prio: "low"
+//             (no blink, dim border), "normal" (default) or "high" (red border, longer blink,
+//             shown before other queued ones). Shown as a card with a progress bar; it closes
+//             when the bar is full (optional "ttl" in seconds, default 15, 0 = until tapped) or
+//             on tap. Up to 4 are queued.
 // Commands (plain text lines): "demo" toggles demo mode, "reset" clears all data,
 //           "flip" turns the display 180 degrees, "contrast" toggles the high-contrast
 //           palette, "gamma" cycles the panel's 4 gamma curves (all remembered across restarts).
@@ -28,6 +33,7 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
+#include <Fonts/FreeSans9pt7b.h>
 #include <Adafruit_ILI9341.h>
 #include <Adafruit_FT6206.h>
 #include <ArduinoJson.h>
@@ -79,6 +85,7 @@
 
 // ---- Colors (RGB565) · Tribe Agency brand palette (tribeagency.nl) ----
 #define C_PANEL  0x1A07  // #1D433B green
+#define C_CARD   0x0903  // #0A201B darker green: notification card, more contrast for its text
 #define C_ACCENT 0xCF2F  // #CFE578 green-light
 #define C_DIM_STD 0x7C4B  // #7C8B5A army
 #define C_DIM_HC  0xB633  // #B7C49A light sage: readable at an angle on TN panels
@@ -138,6 +145,7 @@ struct PlanLimits {
   unsigned long rxAt = 0;
   bool valid = false;
 } lim;
+const unsigned long LIMITS_STALE_MS = 10 * 60 * 1000UL, LIMITS_DROP_MS = 30 * 60 * 1000UL;
 
 uint64_t hours[24] = {0};
 int nowHour = -1;
@@ -160,8 +168,11 @@ struct Notice {
   char title[40];
   char body[160];
   char src[8];
+  char app[25];  // header text; empty = named after src
+  uint8_t prio;  // PRIO_*
   uint16_t ttl;  // seconds until it closes itself, 0 = until tapped
 };
+enum { PRIO_LOW, PRIO_NORMAL, PRIO_HIGH };
 const uint16_t NOTICE_TTL = 15;
 const int MAX_NOTICES = 4;
 Notice notices[MAX_NOTICES];
@@ -278,6 +289,10 @@ void drawStatus() {
     char ago[24] = "";
     if (u.valid && !demo) snprintf(ago, sizeof(ago), "updated %lus ago", age);
     printAt(10, 104, 220, 8, 1, C_DIM, ago);
+    if (lim.valid && !demo && millis() - lim.rxAt > LIMITS_DROP_MS) {
+      lim.valid = false;  // long gone: back to the --limit bar
+      drawOverviewValues();
+    }
     if (lim.valid) drawPlanLimits(259);  // tick the countdowns
   }
 }
@@ -308,20 +323,23 @@ void fmtCountdown(uint32_t s, char* buf, size_t len) {
   else                snprintf(buf, len, "%ud%02uh", (unsigned)(s / 86400), (unsigned)(s % 86400 / 3600));
 }
 
+bool limitsStale() { return !demo && millis() - lim.rxAt > LIMITS_STALE_MS; }
+
 // Two rows under the model: "5H [bar] 42%  3h12m" and "WK [bar] 61%  2d04h".
 // Redrawn every second on the overview so the countdowns tick.
 void drawPlanLimits(int y) {
   static const char* names[2] = {"5H", "WK"};
   unsigned long el = (millis() - lim.rxAt) / 1000;
+  bool stale = limitsStale();  // feeder stopped sending them: show, but don't vouch for them
   for (int i = 0; i < 2; i++) {
     int ry = y + i * 11;
     char b[12];
     label(10, ry, names[i]);
     if (lim.pct[i] < 0) { printAt(30, ry, 200, 8, 1, C_DIM, "-"); continue; }
     float frac = lim.pct[i] / 100.0f;
-    drawHBar(30, ry, 108, frac, levelColor(frac));
+    drawHBar(30, ry, 108, frac, stale ? C_DIM : levelColor(frac));
     snprintf(b, sizeof(b), "%3d%%", lim.pct[i]);
-    printAt(144, ry, 30, 8, 1, C_TEXT, b);
+    printAt(144, ry, 30, 8, 1, stale ? C_DIM : C_TEXT, b);
     if (lim.resetIn[i] == 0)       strcpy(b, "");
     else if (el >= lim.resetIn[i]) strcpy(b, "reset");
     else                           fmtCountdown(lim.resetIn[i] - el, b, sizeof(b));
@@ -547,31 +565,60 @@ void drawPage() {
 }
 
 // ---------- notifications ----------
-// Word-wraps s into lines of at most `cols` characters; returns the number of lines drawn.
-int drawWrapped(int x, int y, int cols, int maxLines, const char* s) {
-  char line[40];
+int textWidth(const char* s) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  tft.getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
+  return w;
+}
+
+// Word-wraps s in FreeSans 9pt within maxW pixels, lineH apart from top y; the last line ends
+// in "..." when the text doesn't fit. Returns the number of lines drawn.
+int drawWrapped(int x, int y, int maxW, int maxLines, int lineH, const char* s) {
+  tft.setFont(&FreeSans9pt7b);
+  char line[64];
   int lines = 0;
   while (*s && lines < maxLines) {
     while (*s == ' ') s++;
-    int len = strlen(s), cut = min(len, cols);
-    if (len > cols) {
-      int sp = cut;
-      while (sp > 0 && s[sp] != ' ') sp--;
-      if (sp > 0) cut = sp;
+    if (!*s) break;
+    int n = strlen(s), fit = 0;
+    while (fit < n) {  // add words while the line fits
+      int next = fit;
+      while (next < n && s[next] == ' ') next++;
+      while (next < n && s[next] != ' ') next++;
+      if (next >= (int)sizeof(line) - 4) break;
+      memcpy(line, s, next);
+      line[next] = 0;
+      if (textWidth(line) > maxW) break;
+      fit = next;
     }
-    if (lines == maxLines - 1 && len > cut) {  // last line: ellipsis
-      cut = min(cut, cols - 3);
-      memcpy(line, s, cut);
-      strcpy(line + cut, "...");
-    } else {
-      memcpy(line, s, cut);
-      line[cut] = 0;
+    if (fit == 0) {  // one word wider than the line: cut it
+      fit = 1;
+      while (fit < n && fit < (int)sizeof(line) - 4) {
+        memcpy(line, s, fit + 1);
+        line[fit + 1] = 0;
+        if (textWidth(line) > maxW) break;
+        fit++;
+      }
     }
-    tft.setCursor(x, y + lines * 12);
+    const char* rest = s + fit;
+    while (*rest == ' ') rest++;
+    int len = fit;
+    memcpy(line, s, len);
+    line[len] = 0;
+    if (lines == maxLines - 1 && *rest) {  // last line and more to come: ellipsis
+      while (len > 0) {
+        strcpy(line + len, "...");
+        if (textWidth(line) <= maxW) break;
+        len--;
+      }
+    }
+    tft.setCursor(x, y + lines * lineH + 13);  // the cursor is the baseline with this font
     tft.print(line);
-    s += cut;
+    s += fit;
     lines++;
   }
+  tft.setFont();  // back to the built-in font
   return lines;
 }
 
@@ -587,24 +634,42 @@ int noticeBarFill() {
 void drawNotice() {
   const Notice& n = notices[0];
   const int x = NC_X, y = NC_Y, w = NC_W, h = NC_H;
-  tft.fillRoundRect(x, y, w, h, 8, C_PANEL);
-  tft.drawRoundRect(x, y, w, h, 8, C_ACCENT);
-  tft.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 7, C_ACCENT);
+  uint16_t border = n.prio == PRIO_HIGH ? C_RED : n.prio == PRIO_LOW ? C_DIM : C_ACCENT;
+  tft.fillRoundRect(x, y, w, h, 8, C_CARD);
+  tft.drawRoundRect(x, y, w, h, 8, border);
+  tft.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 7, border);
 
+  // Header: the app name (webhooks) or where it came from, uppercase; priority badge on the right
+  char head[25];
+  const char* from = n.app[0] ? n.app
+                   : strcmp(n.src, "desktop") == 0 ? "Claude Desktop"
+                   : strcmp(n.src, "code") == 0 ? "Claude Code" : "Webhook";
+  strlcpy(head, from, sizeof(head));  // 24 chars leave room for the badge
+  for (char* c = head; *c; c++) *c = toupper(*c);
   tft.setTextSize(1);
-  tft.setTextColor(C_ACCENT, C_PANEL);
+  tft.setTextColor(C_ACCENT, C_CARD);
   tft.setCursor(x + 12, y + 12);
-  tft.print(strcmp(n.src, "desktop") == 0 ? "CLAUDE DESKTOP" : "CLAUDE CODE");
+  tft.print(head);
+  if (n.prio != PRIO_NORMAL) {
+    const char* badge = n.prio == PRIO_HIGH ? "HIGH" : "LOW";
+    tft.setTextColor(n.prio == PRIO_HIGH ? C_RED : C_DIM, C_CARD);
+    tft.setCursor(x + w - 12 - strlen(badge) * 6, y + 12);
+    tft.print(badge);
+  }
 
-  char t[18];
-  strlcpy(t, n.title, sizeof(t));  // 17 chars fit at size 2
-  tft.setTextSize(2);
-  tft.setTextColor(C_TEXT, C_PANEL);
-  tft.setCursor(x + 12, y + 28);
-  tft.print(t);
-
+  int bodyY = y + 26, bodyLines = 8;  // without a title the message uses its space
+  if (n.title[0]) {
+    char t[18];
+    strlcpy(t, n.title, sizeof(t));  // 17 chars fit at size 2
+    tft.setTextSize(2);
+    tft.setTextColor(C_TEXT, C_CARD);
+    tft.setCursor(x + 12, y + 28);
+    tft.print(t);
+    bodyY = y + 50; bodyLines = 6;
+  }
   tft.setTextSize(1);
-  drawWrapped(x + 12, y + 54, 32, 9, n.body);
+  tft.setTextColor(C_TEXT);  // custom fonts draw without a background; the card is filled already
+  drawWrapped(x + 12, bodyY, w - 24, bodyLines, 18, n.body);
 
   if (n.ttl) {  // track, then the part that has already elapsed
     noticeBarDrawn = noticeBarFill();
@@ -612,7 +677,7 @@ void drawNotice() {
     tft.fillRect(NB_X, NB_Y, noticeBarDrawn, 4, C_ACCENT);
   }
 
-  tft.setTextColor(C_DIM, C_PANEL);
+  tft.setTextColor(C_DIM, C_CARD);
   tft.setCursor(x + 12, y + h - 18);
   tft.print("tap to dismiss");
   if (nNotices > 1) {
@@ -623,18 +688,37 @@ void drawNotice() {
   }
 }
 
-void pushNotice(const char* title, const char* body, const char* src, uint16_t ttl) {
+uint8_t parsePrio(const char* p) {
+  if (!p) return PRIO_NORMAL;
+  if (strcmp(p, "high") == 0) return PRIO_HIGH;
+  if (strcmp(p, "low") == 0) return PRIO_LOW;
+  return PRIO_NORMAL;
+}
+
+void pushNotice(const char* title, const char* body, const char* src, uint16_t ttl,
+                const char* app = "", uint8_t prio = PRIO_NORMAL) {
   if (nNotices == MAX_NOTICES) {  // drop the oldest queued one, keep the one on screen
     memmove(&notices[1], &notices[2], (MAX_NOTICES - 2) * sizeof(Notice));
     nNotices--;
   }
-  Notice& n = notices[nNotices++];
-  strlcpy(n.title, title, sizeof(n.title));
-  strlcpy(n.body, body, sizeof(n.body));
-  strlcpy(n.src, src, sizeof(n.src));
-  n.ttl = ttl;
+  Notice nw;
+  strlcpy(nw.title, title, sizeof(nw.title));
+  strlcpy(nw.body, body, sizeof(nw.body));
+  strlcpy(nw.src, src, sizeof(nw.src));
+  strlcpy(nw.app, app, sizeof(nw.app));
+  nw.prio = prio;
+  nw.ttl = ttl;
+  // High priority goes straight after the card on screen, ahead of the other queued ones
+  int at = nNotices;
+  if (prio == PRIO_HIGH && nNotices > 1) {
+    at = 1;
+    while (at < nNotices && notices[at].prio == PRIO_HIGH) at++;  // keep high ones in order
+    memmove(&notices[at + 1], &notices[at], (nNotices - at) * sizeof(Notice));
+  }
+  notices[at] = nw;
+  nNotices++;
   if (nNotices == 1) noticeShownAt = millis();  // queued ones start their timer when shown
-  blinkUntil = millis() + 1200;
+  if (prio != PRIO_LOW) blinkUntil = millis() + (prio == PRIO_HIGH ? 3000 : 1200);
   drawNotice();  // redraws the card in place (also updates "+N more")
 }
 
@@ -773,7 +857,8 @@ void handleLine(char* line) {
 
   if (doc["notify"].is<JsonObject>()) {
     JsonObject o = doc["notify"].as<JsonObject>();
-    pushNotice(o["title"] | "Claude", o["body"] | "", o["src"] | "code", o["ttl"] | NOTICE_TTL);
+    pushNotice(o["title"] | "", o["body"] | "", o["src"] | "code", o["ttl"] | NOTICE_TTL,
+               o["app"] | "", parsePrio(o["prio"]));
     Serial.println("{\"ok\":true}");
     return;
   }
@@ -954,7 +1039,7 @@ void startDemo() {
 
 // A random example notification every 20-40 s while demo mode runs.
 void demoNotice() {
-  static const char* const samples[][3] = {
+  static const char* const samples[][5] = {  // title, body, src, app, prio
     {"tribebuddy", "Claude needs your permission to use Bash", "code"},
     {"tribebuddy", "Finished - waiting for you", "code"},
     {"bespeak-frontend", "Claude is waiting for your input", "code"},
@@ -962,10 +1047,15 @@ void demoNotice() {
     {"Cowork", "Your task \"Quarterly report\" is ready to review", "desktop"},
     {"Cowork", "Claude needs your approval to send an email to 3 recipients", "desktop"},
     {"Claude", "Research on ISO 9001 audit checklist is complete", "desktop"},
+    {"Deploy failed", "tribe-website: build failed on main (step: test)", "hook", "GitHub Actions", "high"},
+    {"", "Backup of the Drive finished, 2,431 files", "hook", "Backup", "low"},
+    {"", "Site down: bespeak.nl returned 502 for 2 minutes", "hook", "UptimeRobot", "high"},
   };
   const int n = sizeof(samples) / sizeof(samples[0]);
   int i = random(0, n);
-  pushNotice(samples[i][0], samples[i][1], samples[i][2], NOTICE_TTL);
+  uint8_t prio = parsePrio(samples[i][4]);
+  pushNotice(samples[i][0], samples[i][1], samples[i][2], NOTICE_TTL,
+             samples[i][3] ? samples[i][3] : "", prio);
 }
 
 void demoTick() {

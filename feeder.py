@@ -16,6 +16,7 @@ Notifications, shown as a card on the display until tapped:
   * Claude Desktop / Cowork (macOS only): read from the macOS notification database.
     That needs Full Disk Access for the app running the feeder (Terminal, iTerm, ...);
     without it the feeder prints a hint and carries on with the rest.
+  * Anything else: POST to the webhook, http://localhost:8787/notify (see WebhookListener).
 
     pip install pyserial
     python3 feeder.py install-hooks            # once: add the Claude Code hooks
@@ -45,6 +46,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 from collections import defaultdict
@@ -99,8 +101,15 @@ def to_ascii(text, limit):
     return text[:limit]
 
 
-def notice(title, body, src):
-    return {"notify": {"title": to_ascii(title, 39), "body": to_ascii(body, 159), "src": src}}
+def notice(title, body, src, app=None, prio=None, ttl=None):
+    n = {"title": to_ascii(title, 39), "body": to_ascii(body, 159), "src": src}
+    if app:
+        n["app"] = to_ascii(app, 24)
+    if prio and prio != "normal":
+        n["prio"] = prio
+    if ttl is not None:
+        n["ttl"] = max(0, min(int(ttl), 65535))
+    return {"notify": n}
 
 
 def normalize_model(model):
@@ -368,8 +377,11 @@ class PlanLimits:
     def __init__(self, interval, log):
         self.interval, self.log = interval, log
         self.windows = None  # {"5h": (percent, resets_at or None), ...} from the last good poll
+        self.good_at = 0.0   # monotonic time of that poll
         self.next_poll = 0.0
         self.last_error = None
+        self.thread = None   # the fetch runs in the background: a Keychain prompt or a slow
+        self.result = None   # network must not hold up notifications
 
     def _token(self):
         raw = None
@@ -385,7 +397,7 @@ class PlanLimits:
         oauth = json.loads(raw).get("claudeAiOauth") or {}
         if not oauth.get("accessToken"):
             raise RuntimeError("Claude Code isn't logged in with a Claude plan (API keys have no plan limits)")
-        if (oauth.get("expiresAt") or 0) / 1000 < time.time():
+        if oauth.get("expiresAt") and oauth["expiresAt"] / 1000 < time.time():
             raise RuntimeError("Claude Code's login token has expired; it renews the next time you use Claude Code")
         return oauth["accessToken"]
 
@@ -399,14 +411,33 @@ class PlanLimits:
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.load(r)
 
-    def poll(self):
-        """Refreshes the numbers every `interval` seconds; True when they were updated."""
-        if time.monotonic() < self.next_poll:
-            return False
-        self.next_poll = time.monotonic() + self.interval
+    def _run(self):
         try:
-            data = self._fetch()
-        except Exception as e:  # network, HTTP error, keychain, bad JSON: keep the last numbers
+            self.result = (self._fetch(), None)
+        except Exception as e:  # network, HTTP error, keychain, bad JSON
+            self.result = (None, e)
+
+    def poll(self, wait=False):
+        """Starts a fetch every `interval` seconds and picks up its result; True when new
+        numbers came in. `wait` blocks until the fetch is done (for --once)."""
+        if self.thread is None and time.monotonic() >= self.next_poll:
+            self.next_poll = time.monotonic() + self.interval
+            self.result = None
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+        if self.thread is None:
+            return False
+        if wait:
+            self.thread.join()
+        if self.thread.is_alive():
+            return False
+        self.thread = None
+        data, e = self.result
+        if e is None:
+            windows = self._parse(data)
+            if not windows:
+                e = RuntimeError("unexpected response (no utilization); the endpoint may have changed")
+        if e is not None:  # keep the last numbers until they go stale (see message)
             err = f"{e.code} {e.reason}" if hasattr(e, "code") else str(e)
             if getattr(e, "code", None) == 429:
                 self.next_poll = time.monotonic() + max(self.interval, 600)
@@ -417,7 +448,13 @@ class PlanLimits:
         if self.last_error:
             self.log("plan limits available again")
         self.last_error = None
+        self.windows, self.good_at = windows, time.monotonic()
+        return True
+
+    def _parse(self, data):
         windows = {}
+        if not isinstance(data, dict):
+            return windows
         for key, short in self.WINDOWS:
             w = data.get(key)
             if not isinstance(w, dict) or w.get("utilization") is None:
@@ -428,20 +465,241 @@ class PlanLimits:
                     reset = datetime.fromisoformat(w["resets_at"].replace("Z", "+00:00"))
                 except ValueError:
                     pass
-            windows[short] = (float(w["utilization"]), reset)
-        self.windows = windows or None
-        return True
+            try:
+                windows[short] = (float(w["utilization"]), reset)
+            except (TypeError, ValueError):
+                pass
+        return windows
 
     def message(self):
         """{"limits":{"5h":42,"5h_in":4320,...}}: percent used and seconds until the reset."""
-        if not self.windows:
+        # Numbers from 3 failed polls ago are stale: stop sending them (the board then greys
+        # them out and later falls back to the --limit bar).
+        if not self.windows or time.monotonic() - self.good_at > 3 * self.interval + 60:
             return None
         now = datetime.now(timezone.utc)
         out = {}
         for short, (pct, reset) in self.windows.items():
             out[short] = round(max(0.0, min(pct, 100.0)))
-            out[short + "_in"] = max(0, int((reset - now).total_seconds())) if reset else 0
+            # 0 = reset time unknown; a reset that has passed is sent as 1 so the board says "reset"
+            out[short + "_in"] = max(1, int((reset - now).total_seconds())) if reset else 0
         return {"limits": out}
+
+
+class WebhookListener:
+    """Generic webhook: any app or script can put a notification on the display.
+
+        curl -d "Deploy finished" "http://localhost:8787/notify?app=CI"
+        curl -H "Content-Type: application/json" -d '{"app":"GitHub","title":"Deploy failed",
+             "message":"tribe-website: build failed on main","priority":"high"}' localhost:8787/notify
+
+    Accepts JSON, form fields or a plain-text body (the message), plus query parameters.
+    Fields (first alias found wins):
+      app      app, source, src, sender, app_name  - card header
+      message  message, body, text, msg, content   - required (or a title)
+      title    title, subject                      - optional big line
+      priority priority, prio, level, severity     - low / normal / high, or 1-5 (ntfy style)
+      ttl      seconds on screen, 0 = until tapped (default: --notify-seconds)
+    Listens on localhost only unless a token is set (Authorization: Bearer <token>,
+    X-Token: <token> or ?token=<token>). Requests carrying a browser Origin header are refused,
+    so web pages you visit can't post to it.
+    """
+
+    MAX_BODY = 16 * 1024
+    MAX_PENDING = 20
+    ALIASES = {
+        "app": ("app", "source", "src", "sender", "app_name"),
+        "message": ("message", "body", "text", "msg", "content"),
+        "title": ("title", "subject"),
+        "priority": ("priority", "prio", "level", "severity"),
+        "ttl": ("ttl",),
+    }
+    KNOWN = {k for names in ALIASES.values() for k in names}
+    HIGH = {"high", "urgent", "critical", "max", "emergency", "error", "4", "5"}
+    LOW = {"low", "min", "info", "debug", "1", "2"}
+
+    def __init__(self, host, port, token, log):
+        import http.server
+        self.token, self.log = token, log
+        self.pending, self.lock = [], threading.Lock()
+        listener = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):  # quiet: delivered notifications are logged by the feeder
+                pass
+
+            def reply(self, code, obj):
+                data = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                if self.path.split("?")[0] in ("/", "/health"):
+                    self.reply(200, {"ok": True, "service": "tribebuddy"})
+                else:
+                    self.reply(404, {"ok": False, "error": "POST to /notify"})
+
+            def do_POST(self):
+                code, obj = listener.handle(self)
+                self.reply(code, obj)
+
+        self.server = http.server.ThreadingHTTPServer((host, port), Handler)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def field(cls, data, name):
+        for key in cls.ALIASES[name]:
+            v = data.get(key)
+            if isinstance(v, list):  # parse_qs gives lists
+                v = v[0] if v else None
+            if v is not None and str(v).strip() != "":
+                return v
+        return None
+
+    @classmethod
+    def priority(cls, value):
+        v = str(value or "").strip().lower()
+        return "high" if v in cls.HIGH else "low" if v in cls.LOW else "normal"
+
+    def _authorized(self, req, query):
+        if not self.token:
+            return True
+        import hmac
+        auth = req.headers.get("Authorization", "")
+        given = (auth[7:] if auth.lower().startswith("bearer ") else None) \
+            or req.headers.get("X-Token") or (query.get("token") or [None])[0]
+        return bool(given) and hmac.compare_digest(given.encode(), self.token.encode())
+
+    def handle(self, req):
+        """Parses one POST; returns (HTTP status, JSON reply)."""
+        from urllib.parse import parse_qs, urlsplit
+        url = urlsplit(req.path)
+        if url.path not in ("/", "/notify"):
+            return 404, {"ok": False, "error": "POST to /notify"}
+        if req.headers.get("Origin"):
+            return 403, {"ok": False, "error": "browser requests are not accepted"}
+        query = parse_qs(url.query)
+        if not self._authorized(req, query):
+            return 401, {"ok": False, "error": "missing or wrong token"}
+        try:
+            length = int(req.headers.get("Content-Length") or 0)
+        except ValueError:
+            return 400, {"ok": False, "error": "bad Content-Length"}
+        if length > self.MAX_BODY:
+            return 413, {"ok": False, "error": f"body over {self.MAX_BODY} bytes"}
+        raw = req.rfile.read(length).decode("utf-8", errors="replace") if length else ""
+        ctype = (req.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+
+        data = dict(query)
+        data.pop("token", None)
+        if ctype == "application/json" or (not ctype and raw.lstrip().startswith("{")):
+            try:
+                body = json.loads(raw or "{}")
+            except ValueError:
+                return 400, {"ok": False, "error": "invalid JSON"}
+            if not isinstance(body, dict):
+                return 400, {"ok": False, "error": "JSON body must be an object"}
+            data.update(body)
+        elif ctype == "application/x-www-form-urlencoded" and any(
+                k in self.KNOWN for k in parse_qs(raw)):
+            data.update(parse_qs(raw))
+        elif raw.strip():  # plain text, or `curl -d "some text"` (sent as a form without fields)
+            data["message"] = raw
+
+        message, title = self.field(data, "message"), self.field(data, "title")
+        if message is None and title is None:
+            return 400, {"ok": False, "error": "a message (or title) is required"}
+        prio = self.priority(self.field(data, "priority"))
+        ttl = self.field(data, "ttl")
+        try:
+            ttl = int(ttl) if ttl is not None else None  # None: --notify-seconds, with the progress bar
+        except (TypeError, ValueError):
+            return 400, {"ok": False, "error": "ttl must be a number of seconds"}
+        n = notice(title or "", message or "", "hook", self.field(data, "app") or "Webhook", prio, ttl)
+        with self.lock:
+            if len(self.pending) >= self.MAX_PENDING:
+                return 503, {"ok": False, "error": "too many pending notifications"}
+            self.pending.append(n)
+        return 202, {"ok": True}
+
+    def poll(self):
+        with self.lock:
+            out, self.pending = self.pending, []
+        return out
+
+
+class NgrokTunnel:
+    """Runs `ngrok http` in front of the webhook so cloud services (Jira, Bitbucket) can reach it.
+
+    Set up once: install ngrok (brew install ngrok), `ngrok config add-authtoken <token>` from
+    dashboard.ngrok.com. Free accounts get one fixed domain assigned (not chosen: custom names
+    are paid, ERR_NGROK_313); it's under Universal Gateway > Domains on the dashboard. Restarted when it exits; stopped with the feeder.
+    """
+
+    SEARCH = ["/opt/homebrew/bin", "/usr/local/bin", os.path.expanduser("~/.local/bin"), "/snap/bin"]
+
+    def __init__(self, port, domain, token, log):
+        self.port, self.domain, self.token, self.log = port, domain, token, log
+        self.proc, self.url, self.restart_at = None, None, 0.0
+        self.backoff, self.last_error = 10, None
+        # launchd starts services with a minimal PATH, so look in the usual install places too
+        self.binary = shutil.which("ngrok") or shutil.which("ngrok", path=os.pathsep.join(self.SEARCH))
+        if not self.binary:
+            raise RuntimeError("ngrok not found: brew install ngrok (or see ngrok.com/download)")
+        import atexit
+        atexit.register(self.stop)
+
+    def start(self):
+        cmd = [self.binary, "http", f"127.0.0.1:{self.port}", "--log", "stdout", "--log-format", "json"]
+        if self.domain:
+            cmd += ["--url", self.domain if "://" in self.domain else "https://" + self.domain]
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     stdin=subprocess.DEVNULL, text=True)
+        threading.Thread(target=self._read, args=(self.proc,), daemon=True).start()
+
+    def _read(self, proc):
+        for raw in proc.stdout:
+            try:
+                e = json.loads(raw)
+            except ValueError:
+                continue
+            if e.get("msg") == "started tunnel" and e.get("url"):
+                self.url, self.backoff, self.last_error = e["url"], 10, None
+                self.log(f"tunnel up: {self.url}/notify  (send the token as "
+                         f"'Authorization: Bearer ...' or ?token=...)")
+                if not self.domain:
+                    self.log("ngrok picked this URL; pass it as --tunnel-domain to pin it")
+            elif e.get("lvl") in ("eror", "crit") and e.get("err") not in (None, "<nil>"):
+                err = str(e["err"]).strip().splitlines()[0]  # ngrok errors run over several lines
+                code = re.search(r"ERR_NGROK_\d+", str(e["err"]))
+                err += f" ({code.group(0)})" if code else ""
+                if err != self.last_error:  # each distinct error once
+                    self.log(f"ngrok: {err}")
+                    self.last_error = err
+
+    def tick(self):
+        """Restarts ngrok after it exits (network change, auth problem, ...): 10 s, doubling to 5 min."""
+        if self.proc and self.proc.poll() is not None:
+            if self.url or self.backoff == 10:
+                self.log(f"tunnel down (ngrok exited with {self.proc.returncode}); retrying, "
+                         "backing off to every 5 minutes while it keeps failing")
+            self.proc, self.url = None, None
+            self.restart_at = time.monotonic() + self.backoff
+            self.backoff = min(self.backoff * 2, 300)
+        if self.proc is None and time.monotonic() >= self.restart_at:
+            self.start()
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
 
 
 # ---------- Claude Code hooks ----------
@@ -696,6 +954,16 @@ def main():
                     help="don't read Claude Desktop notifications (macOS)")
     ap.add_argument("--limits-interval", type=float, default=120,
                     help="seconds between plan limit checks (5-hour and weekly)")
+    ap.add_argument("--webhook-port", type=int, default=8787,
+                    help="port of the notification webhook (0 = off); POST to /notify")
+    ap.add_argument("--webhook-host", default="127.0.0.1",
+                    help="address the webhook listens on; anything but localhost needs a token")
+    ap.add_argument("--webhook-token", default=os.environ.get("TRIBEBUDDY_WEBHOOK_TOKEN"),
+                    help="shared secret for the webhook (or set TRIBEBUDDY_WEBHOOK_TOKEN)")
+    ap.add_argument("--tunnel", choices=["ngrok"],
+                    help="make the webhook reachable from the internet (Jira, Bitbucket); needs a token")
+    ap.add_argument("--tunnel-domain", default=os.environ.get("TRIBEBUDDY_TUNNEL_DOMAIN"),
+                    help="your ngrok domain, e.g. discharge-gimmick-lard.ngrok-free.dev (Dashboard > Domains)")
     ap.add_argument("--no-limits", action="store_true",
                     help="don't show plan limits (skips reading Claude Code's login token)")
     args = ap.parse_args()
@@ -746,10 +1014,10 @@ def main():
         failed = 0
         for msg in msgs:
             if "notify" in msg:
-                msg["notify"]["ttl"] = max(0, min(args.notify_seconds, 65535))
+                msg["notify"].setdefault("ttl", max(0, min(args.notify_seconds, 65535)))
             line = json.dumps(msg, separators=(",", ":"))
-            if port is None:
-                print(line)
+            if args.dry_run:
+                print(line, flush=True)
                 continue
             if port is None:  # disconnected earlier in this batch
                 failed += 1
@@ -781,7 +1049,31 @@ def main():
         return f"{n / 1e6:.2f}M" if n >= 1e6 else f"{n / 1e3:.1f}K" if n >= 1e4 else str(n)
 
     limits = PlanLimits(max(30.0, args.limits_interval), log) if not args.no_limits else None
-    sources = ["Claude Code hooks"] + (["Claude Desktop"] if desktop and desktop.enabled else [])
+    webhook = None
+    if args.webhook_port:
+        if args.webhook_host not in ("127.0.0.1", "localhost", "::1") and not args.webhook_token:
+            sys.exit(f"--webhook-host {args.webhook_host} is reachable from other machines: "
+                     "set --webhook-token (or TRIBEBUDDY_WEBHOOK_TOKEN) too")
+        try:
+            webhook = WebhookListener(args.webhook_host, args.webhook_port, args.webhook_token, log)
+        except OSError as e:  # port taken, e.g. by a second feeder
+            log(f"webhook off: can't listen on {args.webhook_host}:{args.webhook_port} ({e})")
+    tunnel = None
+    if args.tunnel:
+        if not args.webhook_port:
+            sys.exit("--tunnel needs the webhook (--webhook-port)")
+        if not args.webhook_token:
+            import secrets
+            sys.exit("--tunnel puts the webhook on the internet: set --webhook-token (or "
+                     "TRIBEBUDDY_WEBHOOK_TOKEN) too, for example:\n  --webhook-token "
+                     + secrets.token_urlsafe(24))
+        if webhook:
+            try:
+                tunnel = NgrokTunnel(args.webhook_port, args.tunnel_domain, args.webhook_token, log)
+            except RuntimeError as e:
+                log(f"tunnel off: {e}")
+    sources = ["Claude Code hooks"] + (["Claude Desktop"] if desktop and desktop.enabled else []) \
+        + ([f"webhook http://{args.webhook_host}:{args.webhook_port}/notify"] if webhook else [])
     log(f"TribeBuddy feeder -> {'stdout (dry run)' if args.dry_run else args.port}")
     log(f"usage every {args.interval:g}s from {', '.join(roots)}; "
         f"notifications from {' + '.join(sources)}. Ctrl+C to stop.")
@@ -789,6 +1081,8 @@ def main():
     next_scan = 0.0
     waiting = False
     while True:
+        if tunnel:
+            tunnel.tick()
         if not args.dry_run and port is None:
             port = connect()
             if port is None:
@@ -797,17 +1091,20 @@ def main():
                 time.sleep(5)
                 continue
             next_scan = 0.0  # fresh connection (or a restarted board): send everything now
-        notes = spool.poll() + (desktop.poll() if desktop else [])
+        notes = spool.poll() + (desktop.poll() if desktop else []) + (webhook.poll() if webhook else [])
         if notes:
             failed = send(notes)
             if not args.dry_run:
                 for n in notes:
-                    log(f"notification ({n['notify']['src']}): {n['notify']['title']} - {n['notify']['body']}"
+                    m = n["notify"]
+                    log(f"notification ({m.get('app') or m['src']}, {m.get('prio', 'normal')}): "
+                        f"{m['title']} - {m['body']}"
                         + (" [not delivered]" if failed else ""))
-        if limits and limits.poll() and time.monotonic() < next_scan:
-            send([limits.message()])  # new numbers between usage scans
+        lim = limits.message() if limits and limits.poll(wait=args.once) else None
+        if lim and time.monotonic() < next_scan:
+            send([lim])  # new numbers between usage scans
             if not args.dry_run:
-                log("plan limits: " + ", ".join(f"{k} {v}%" for k, v in limits.message()["limits"].items()
+                log("plan limits: " + ", ".join(f"{k} {v}%" for k, v in lim["limits"].items()
                                                 if not k.endswith("_in")))
         if time.monotonic() >= next_scan:
             usage.scan(roots)
