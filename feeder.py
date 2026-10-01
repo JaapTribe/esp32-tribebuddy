@@ -35,12 +35,15 @@ Works on Linux and macOS (anything with Python 3.8+).
 """
 
 import argparse
+import base64
+import fnmatch
 import getpass
 import glob
 import json
 import os
 import plistlib
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
@@ -87,7 +90,13 @@ SPOOL = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cac
                      "tribebuddy", "notify.jsonl")
 SETTINGS = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude")),
                         "settings.json")
-HOOK_EVENTS = ["Notification", "Stop"]
+HOOK_EVENTS = ["Notification", "Stop", "SessionStart", "SessionEnd", "UserPromptSubmit", "PostToolUse"]
+NOTIFY_EVENTS = {"Notification", "Stop"}  # these also put a card on the display
+# Approving permission requests on the display (install-hooks --approve and feeder --approve):
+CACHE_DIR = os.path.dirname(SPOOL)
+STATE_FILE = os.path.join(CACHE_DIR, "feeder.json")  # heartbeat: is a feeder with a board there?
+APPROVALS = os.path.join(CACHE_DIR, "approvals")     # <id>.req from the hook, <id>.res back
+APPROVE_WAIT = 25  # seconds the hook waits for a tap before the terminal asks instead
 
 _ASCII = {"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2013": "-",
           "\u2014": "-", "\u2026": "...", "\u00a0": " ", "\u2022": "*"}
@@ -99,6 +108,15 @@ def to_ascii(text, limit):
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
     text = " ".join(text.split())
     return text[:limit]
+
+
+def shorten(name, limit):
+    """Long names lose their middle, so similar ones stay apart: tijd-voor-to..-backend."""
+    name = to_ascii(name, 200)
+    if len(name) <= limit:
+        return name
+    head = (limit - 2) // 2
+    return name[:head] + ".." + name[-(limit - 2 - head):]
 
 
 def notice(title, body, src, app=None, prio=None, ttl=None):
@@ -149,6 +167,7 @@ class Usage:
 
     def __init__(self):
         self.buckets = defaultdict(lambda: [0, 0, 0, 0, 0.0])  # in, out, cr, cw, cost
+        self.projects = defaultdict(lambda: [0, 0.0])  # (local date, project folder): tokens, cost
         self.seen = set()
         self.offsets = {}
         self.last_model = "-"
@@ -208,7 +227,13 @@ class Usage:
         b[1] += usage.get("output_tokens", 0) or 0
         b[2] += usage.get("cache_read_input_tokens", 0) or 0
         b[3] += usage.get("cache_creation_input_tokens", 0) or 0
-        b[4] += cost_of(model, usage, usage.get("speed"))
+        cost = cost_of(model, usage, usage.get("speed"))
+        b[4] += cost
+        project = os.path.basename((e.get("cwd") or "").rstrip("/")) or "?"
+        pr = self.projects[(when.date(), project)]
+        pr[0] += (usage.get("input_tokens", 0) or 0) + (usage.get("output_tokens", 0) or 0) \
+            + (usage.get("cache_creation_input_tokens", 0) or 0)
+        pr[1] += cost
         if self.last_ts is None or when > self.last_ts:
             self.last_ts, self.last_model = when, model
 
@@ -250,19 +275,32 @@ class Usage:
             tok, cost = per_day.get(d, (0, 0.0))
             days.append({"d": d.strftime("%m-%d"), "tok": tok, "cost": round(cost, 2)})
 
+        ranked_p = sorted(((name, v) for (day, name), v in self.projects.items() if day == today),
+                          key=lambda kv: -kv[1][1])[:MAX_MODELS]
+        projects = [{"name": to_ascii(name, 24), "tok": v[0], "cost": round(v[1], 2)} for name, v in ranked_p]
+
         return [
             overview,
             {"models": models},
             {"days": days},
             {"hours": per_hour, "now": now.hour},
+            {"projects": projects},
+            clock_message(),
         ]
 
 
-class HookSpool:
-    """Notifications queued by `feeder.py hook` (one JSON object per line)."""
+def clock_message():
+    """{"time": seconds since 1970 in local time}: the board has no clock of its own."""
+    now = datetime.now().astimezone()
+    return {"time": int(now.timestamp() + now.utcoffset().total_seconds())}
 
-    def __init__(self, path=SPOOL):
-        self.path = path
+
+class HookSpool:
+    """Events queued by `feeder.py hook` (one JSON object per line): session updates go to
+    `sessions`, Notification/Stop come back as notifications."""
+
+    def __init__(self, sessions, path=SPOOL):
+        self.path, self.sessions = path, sessions
         try:
             self.offset = os.path.getsize(path)  # skip anything queued before we started
         except OSError:
@@ -286,7 +324,10 @@ class HookSpool:
         for raw in data[:end].splitlines():
             try:
                 n = json.loads(raw)
-                out.append(notice(n.get("title"), n.get("body"), n.get("src", "code")))
+                if n.get("event"):
+                    self.sessions.update(n)
+                if n.get("title") or n.get("body"):  # older lines have no "event"
+                    out.append(notice(n.get("title"), n.get("body"), n.get("src", "code")))
             except (ValueError, AttributeError):
                 pass
         if size > 256 * 1024 and self.offset == size:  # keep the spool small
@@ -373,6 +414,7 @@ class PlanLimits:
     CREDENTIALS = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude")),
                                ".credentials.json")
     WINDOWS = [("five_hour", "5h"), ("seven_day", "7d")]
+    LENGTH = {"5h": 5 * 3600, "7d": 7 * 86400}  # window lengths, for the forecast
 
     def __init__(self, interval, log):
         self.interval, self.log = interval, log
@@ -482,7 +524,16 @@ class PlanLimits:
         for short, (pct, reset) in self.windows.items():
             out[short] = round(max(0.0, min(pct, 100.0)))
             # 0 = reset time unknown; a reset that has passed is sent as 1 so the board says "reset"
-            out[short + "_in"] = max(1, int((reset - now).total_seconds())) if reset else 0
+            left = int((reset - now).total_seconds()) if reset else 0
+            out[short + "_in"] = max(1, left) if reset else 0
+            # Forecast at the pace since the window started: percent at the reset, and seconds
+            # until 100% when that comes first. Too early in the window (<10%) to say.
+            elapsed = self.LENGTH[short] - left
+            if reset and left > 0 and elapsed > self.LENGTH[short] * 0.1 and pct > 0:
+                rate = pct / elapsed  # percent per second
+                out[short + "_proj"] = min(999, round(pct + rate * left))
+                if pct < 100 and pct + rate * left >= 100:
+                    out[short + "_full"] = int((100 - pct) / rate)
         return {"limits": out}
 
 
@@ -632,6 +683,184 @@ class WebhookListener:
         return out
 
 
+class BitbucketPipelines:
+    """Pipelines on chosen branches across a whole Bitbucket Cloud workspace, via the REST API.
+
+    Bitbucket has no workspace-wide pipeline list, and a repository's updated_on doesn't change
+    on a push, so: the first scan checks every repository once (fills the page, no
+    notifications). After that, every `interval` seconds, repositories with a run in the last
+    HOT hours (any branch) or one still going are checked, plus a few others in rotation, within
+    `budget` requests an hour (Bitbucket allows about 1000). A repository that wakes up after a
+    quiet spell is therefore noticed within one rotation; from then on it's checked every scan.
+    A changed state gives a notification; `message()` is the latest run per repo and branch for
+    the Pipelines page. Runs in a thread.
+
+    Auth: an Atlassian API token with scopes read:repository:bitbucket and read:pipeline:bitbucket
+    plus your Atlassian e-mail (Basic auth), or a workspace/repository access token (no e-mail;
+    sent as Bearer).
+    """
+
+    API = "https://api.bitbucket.org/2.0"
+    HOT = 12 * 3600      # repos with a run this recent are checked every scan
+    REPO_REFRESH = 1800  # seconds between fetching the list of repositories
+    MIN_ROTATION = 3     # repos per scan always kept for the rotation
+    MAX_ROWS = 8         # what the page shows
+    PRIO = {"running": "low", "paused": "normal", "passed": "low", "failed": "high", "stopped": "low"}
+    WORDS = {"running": "running", "paused": "waiting for a manual step", "passed": "passed",
+             "failed": "FAILED", "stopped": "stopped"}
+
+    def __init__(self, workspace, token, email, branches, interval, log, budget=600):
+        self.workspace, self.branches, self.interval, self.log = workspace, branches, interval, log
+        self.budget = budget  # API requests per hour
+        self.repos, self.repos_at = [], 0.0
+        self.activity = {}    # repo -> time of its newest run (any branch)
+        self.cursor = 0       # position in the rotation
+        self.auth = ("Basic " + base64.b64encode(f"{email}:{token}".encode()).decode()) if email \
+            else f"Bearer {token}"
+        self.state = {}       # (repo, branch) -> latest run
+        self.notices, self.changed = [], False
+        self.lock = threading.Lock()
+        self.first = True     # the first scan fills the page without notifications
+        self.last_error = None
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _get(self, path, **params):
+        import urllib.parse
+        import urllib.request
+        url = f"{self.API}/{path}?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(url, headers={"Authorization": self.auth, "Accept": "application/json",
+                                                   "User-Agent": "tribebuddy-feeder"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.load(r)
+
+    def _branch_ok(self, ref):
+        return any(fnmatch.fnmatchcase(ref, pat) for pat in self.branches)
+
+    @staticmethod
+    def _status(p):
+        st = p.get("state") or {}
+        if st.get("name") == "COMPLETED":
+            res = (st.get("result") or {}).get("name")
+            return {"SUCCESSFUL": "passed", "FAILED": "failed", "ERROR": "failed"}.get(res, "stopped")
+        if (st.get("stage") or {}).get("name") == "PAUSED":
+            return "paused"
+        return "running"  # PENDING, IN_PROGRESS
+
+    @staticmethod
+    def _time(text):
+        """Seconds since 1970, or None. Bitbucket writes 5 to 9 decimals ("21.059759143Z");
+        Python before 3.11 only reads exactly 3 or 6, so pad/cut them to 6."""
+        if not text:
+            return None
+        t = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], str(text).replace("Z", "+00:00"))
+        try:
+            return datetime.fromisoformat(t).timestamp()
+        except ValueError:
+            return None
+
+    def _loop(self):
+        while True:
+            try:
+                self._scan()
+                if self.last_error:
+                    self.log("Bitbucket pipelines available again")
+                self.last_error = None
+                wait = self.interval
+            except Exception as e:
+                err = f"{e.code} {e.reason}" if hasattr(e, "code") else str(e)
+                hint = {401: " (check the token, and --bitbucket-email for an API token)",
+                        403: " (the token needs read:repository and read:pipeline)",
+                        404: " (check --bitbucket-workspace)"}.get(getattr(e, "code", None), "")
+                if err != self.last_error:
+                    self.log(f"Bitbucket pipelines unavailable: {err}{hint}")
+                    self.last_error = err
+                wait = max(self.interval, 600) if getattr(e, "code", None) == 429 else self.interval
+            time.sleep(wait)
+
+    def _repo_list(self):
+        slugs, page = [], 1
+        while page <= 20:  # 2000 repositories at most
+            v = self._get(f"repositories/{self.workspace}", pagelen=100, page=page, fields="values.slug,next")
+            slugs += [r["slug"] for r in v.get("values", [])]
+            if not v.get("next"):
+                break
+            page += 1
+        return slugs
+
+    def _scan(self):
+        now = time.time()
+        if not self.repos or now - self.repos_at > self.REPO_REFRESH:
+            self.repos, self.repos_at = self._repo_list(), now
+        if self.first:
+            todo = list(self.repos)  # one full sweep to fill the page
+        else:
+            per_scan = max(self.MIN_ROTATION + 1, int(self.budget * self.interval / 3600))
+            busy = {repo for (repo, _), run in self.state.items() if run["state"] in ("running", "paused")}
+            hot = sorted((r for r in self.repos if r in busy or now - self.activity.get(r, 0) < self.HOT),
+                         key=lambda r: -self.activity.get(r, 0))[:per_scan - self.MIN_ROTATION]
+            cold = [r for r in self.repos if r not in hot]  # hot ones over the cap rotate too
+            todo = list(hot)
+            for _ in range(min(per_scan - len(hot), len(cold))):
+                todo.append(cold[self.cursor % len(cold)])
+                self.cursor += 1
+        for slug in todo:
+            self._check(slug)
+        self.first = False
+
+    def _check(self, slug):
+        runs = self._get(f"repositories/{self.workspace}/{slug}/pipelines/", sort="-created_on", pagelen=20,
+                         fields="values.uuid,values.build_number,values.state,values.target.type,"
+                                "values.target.ref_name,values.created_on,values.completed_on,"
+                                "values.creator.display_name").get("values", [])
+        if runs:
+            self.activity[slug] = max(self._time(p.get("created_on")) or 0 for p in runs)
+        seen = set()
+        for p in runs:  # newest first: the first per branch is the latest
+            target = p.get("target") or {}
+            ref = target.get("ref_name")
+            if target.get("type") != "pipeline_ref_target" or not ref or not self._branch_ok(ref) or ref in seen:
+                continue
+            seen.add(ref)
+            status = self._status(p)
+            started = self._time(p.get("created_on")) or time.time()
+            done = self._time(p.get("completed_on")) if status in ("passed", "failed", "stopped") else None
+            self._update({"repo": slug, "branch": ref, "state": status, "num": p.get("build_number"),
+                          "by": (p.get("creator") or {}).get("display_name") or "",
+                          "since": done or started, "uuid": p.get("uuid")})
+
+    def _update(self, run):
+        key = (run["repo"], run["branch"])
+        with self.lock:
+            old = self.state.get(key)
+            if old and old["uuid"] == run["uuid"] and old["state"] == run["state"]:
+                return
+            self.state[key] = run
+            self.changed = True
+            if self.first:
+                return
+            url = f"https://bitbucket.org/{self.workspace}/{run['repo']}/pipelines/results/{run['num']}"
+            short = "FAILED" if run["state"] == "failed" else run["state"]  # the card title fits ~17 chars
+            self.notices.append(notice(f"{run['branch']} {short}",
+                                       f"Pipeline #{run['num']} {self.WORDS[run['state']]} on {run['branch']}"
+                                       + (f", started by {run['by']}" if run["by"] else "") + f". {url}",
+                                       "hook", shorten(run["repo"], 24), self.PRIO[run["state"]]))
+
+    def poll(self):
+        """Notifications for runs that changed since the last call."""
+        with self.lock:
+            out, self.notices = self.notices, []
+        return out
+
+    def message(self):
+        with self.lock:
+            runs = sorted(self.state.values(), key=lambda r: -r["since"])[:self.MAX_ROWS]
+            self.changed = False
+        now = time.time()
+        return {"pipelines": [{"repo": shorten(r["repo"], 18), "branch": shorten(r["branch"], 20),
+                               "state": r["state"], "for": max(0, int(now - r["since"])),
+                               "num": r["num"] or 0, "by": to_ascii(r["by"], 20)} for r in runs]}
+
+
 class NgrokTunnel:
     """Runs `ngrok http` in front of the webhook so cloud services (Jira, Bitbucket) can reach it.
 
@@ -704,7 +933,8 @@ class NgrokTunnel:
 
 # ---------- Claude Code hooks ----------
 def hook_main():
-    """Run by Claude Code: turn the hook event on stdin into a queued notification.
+    """Run by Claude Code: queue the hook event on stdin for the running feeder (session state,
+    and a notification for Notification/Stop).
 
     Never fails and prints nothing, so it can't disturb the Claude Code session.
     """
@@ -712,19 +942,179 @@ def hook_main():
         e = json.load(sys.stdin)
         project = os.path.basename((e.get("cwd") or "").rstrip("/")) or "Claude Code"
         event = e.get("hook_event_name")
-        if event == "Notification":
-            body = e.get("message") or "Needs your attention"
-        elif event == "Stop":
-            if e.get("stop_hook_active"):
-                return
-            body = "Finished - waiting for you"
-        else:
+        if event == "PermissionRequest":
+            approval_hook(e, project)
             return
+        if event not in HOOK_EVENTS or (event == "Stop" and e.get("stop_hook_active")):
+            return
+        rec = {"event": event, "session": e.get("session_id"), "project": project, "ts": time.time()}
+        if event == "Notification":
+            rec.update(title=project, body=e.get("message") or "Needs your attention", src="code")
+        elif event == "Stop":
+            rec.update(title=project, body="Finished - waiting for you", src="code")
+        elif event == "UserPromptSubmit":
+            rec["prompt"] = to_ascii(e.get("prompt") or e.get("user_prompt"), 80)
         os.makedirs(os.path.dirname(SPOOL), exist_ok=True)
         with open(SPOOL, "a") as f:
-            f.write(json.dumps({"title": project, "body": body, "src": "code", "ts": time.time()}) + "\n")
+            f.write(json.dumps(rec) + "\n")
     except Exception:
         pass
+
+
+def tool_summary(tool_input):
+    """The part of a tool call worth reading before allowing it: the command, file, URL, ..."""
+    inp = tool_input if isinstance(tool_input, dict) else {}
+    for key in ("command", "file_path", "url", "notebook_path", "path", "pattern", "query", "prompt"):
+        if inp.get(key):
+            return str(inp[key])
+    return json.dumps(inp)
+
+
+def approval_hook(e, project):
+    """PermissionRequest: ask on the display and print the decision. Printing nothing (feeder not
+    running, no board, no tap within APPROVE_WAIT) lets the terminal ask as usual."""
+    try:
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return
+    if not state.get("approve") or not state.get("board") or time.time() - state.get("ts", 0) > 5:
+        return
+    os.makedirs(APPROVALS, mode=0o700, exist_ok=True)
+    rid = secrets.token_hex(8)
+    req, res = os.path.join(APPROVALS, rid + ".req"), os.path.join(APPROVALS, rid + ".res")
+    with open(req + ".tmp", "w") as f:
+        json.dump({"project": project, "tool": e.get("tool_name") or "?",
+                   "detail": tool_summary(e.get("tool_input")), "ts": time.time()}, f)
+    os.replace(req + ".tmp", req)
+    try:
+        end = time.time() + APPROVE_WAIT
+        while time.time() < end:
+            if os.path.exists(res):
+                with open(res) as f:
+                    answer = json.load(f)
+                if "allow" in answer:  # else the board couldn't ask: terminal
+                    behavior = "allow" if answer["allow"] is True else "deny"
+                    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+                                                             "decision": {"behavior": behavior}}}))
+                return
+            time.sleep(0.2)
+    finally:
+        for path in (req, res):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+class Approvals:
+    """Feeder side of approving on the display: shows requests the hook queued, and writes the
+    answer when the board reports a tap on ALLOW or DENY. Only the board can answer; the id is
+    random and must be one this feeder sent."""
+
+    def __init__(self, log):
+        self.log, self.sent = log, {}  # id -> request
+        os.makedirs(APPROVALS, mode=0o700, exist_ok=True)
+        for name in os.listdir(APPROVALS):  # left over from a crash
+            try:
+                os.remove(os.path.join(APPROVALS, name))
+            except OSError:
+                pass
+
+    def poll(self):
+        """Board messages: new requests to show, and cancels for ones the hook gave up on."""
+        try:
+            ids = {n[:-4] for n in os.listdir(APPROVALS) if n.endswith(".req")}
+        except OSError:
+            return []
+        out = []
+        for rid in sorted(ids - self.sent.keys()):
+            try:
+                with open(os.path.join(APPROVALS, rid + ".req")) as f:
+                    r = json.load(f)
+            except (OSError, ValueError):
+                continue
+            self.sent[rid] = r
+            out.append({"approve": {"id": rid, "app": to_ascii(r.get("project"), 24),
+                                    "tool": to_ascii(r.get("tool"), 23), "detail": to_ascii(r.get("detail"), 159)}})
+        for rid in [k for k in self.sent if k not in ids]:
+            del self.sent[rid]
+            out.append({"approve_cancel": rid})
+        return out
+
+    def _answer(self, rid, answer):
+        path = os.path.join(APPROVALS, rid + ".res")
+        try:
+            with open(path + ".tmp", "w") as f:
+                json.dump(answer, f)
+            os.replace(path + ".tmp", path)
+        except OSError:
+            pass
+
+    def decide(self, rid, allow):
+        r = self.sent.get(rid)
+        if r is None:
+            return
+        self._answer(rid, {"allow": bool(allow)})
+        self.log(f"{'ALLOWED' if allow else 'denied'} on the display: {r.get('project')} "
+                 f"{r.get('tool')}: {str(r.get('detail'))[:80]}")
+
+    def unavailable(self, rid):
+        """The board couldn't ask (no touch position, unplugged): let the terminal ask now."""
+        self._answer(rid, {})
+
+    def drop_all(self):
+        for rid in list(self.sent):
+            self.unavailable(rid)
+
+
+class Sessions:
+    """What each Claude Code session is doing, from the hook events.
+
+    working: after a prompt or a tool call; waiting: Claude asked for something (permission,
+    input); idle: finished its turn. SessionEnd removes it; one without events for 12 hours
+    is dropped too (closed without SessionEnd, e.g. a killed terminal).
+    """
+
+    MAX_AGE = 12 * 3600
+
+    def __init__(self):
+        self.s = {}  # session id -> {"name", "state", "since", "msg", "last"}
+        self.changed = False
+
+    def update(self, rec):
+        sid, event, now = rec.get("session"), rec.get("event"), rec.get("ts") or time.time()
+        if not sid:
+            return
+        if event == "SessionEnd":
+            self.changed |= self.s.pop(sid, None) is not None
+            return
+        cur = self.s.setdefault(sid, {"name": rec.get("project") or "?", "state": "idle",
+                                      "since": now, "msg": "started", "last": now})
+        state, msg = {
+            "SessionStart": ("idle", "started"),
+            "UserPromptSubmit": ("working", rec.get("prompt") or "working"),
+            "PostToolUse": ("working", None),  # keep the prompt as the description
+            "Notification": ("waiting", rec.get("body")),
+            "Stop": ("idle", "finished"),
+        }.get(event, (cur["state"], None))
+        if state != cur["state"]:
+            cur["state"], cur["since"] = state, now
+        if msg:
+            cur["msg"] = msg
+        cur["last"] = now
+        self.changed = True
+
+    def message(self):
+        now = time.time()
+        for sid in [k for k, v in self.s.items() if now - v["last"] > self.MAX_AGE]:
+            del self.s[sid]
+        order = {"waiting": 0, "working": 1, "idle": 2}
+        ranked = sorted(self.s.values(), key=lambda v: (order[v["state"]], -v["last"]))[:6]
+        self.changed = False
+        return {"sessions": [{"name": to_ascii(v["name"], 24), "state": v["state"],
+                              "for": max(0, int(now - v["since"])), "msg": to_ascii(v["msg"], 60)}
+                             for v in ranked]}
 
 
 def _our_hook(entry):
@@ -751,22 +1141,27 @@ def _save_settings(settings):
     os.replace(tmp, SETTINGS)
 
 
-def install_hooks():
+def install_hooks(argv=()):
+    approve = "--approve" in argv
     settings = _load_settings()
     hooks = settings.setdefault("hooks", {})
-    entry = {"hooks": [{
-        "type": "command",
-        "command": sys.executable,
-        "args": [os.path.abspath(__file__), "hook"],  # exec form: no shell, spaces in paths are fine
-        "async": True,
-        "timeout": 10,
-    }]}
-    for event in HOOK_EVENTS:
+    cmd = {"type": "command", "command": sys.executable,
+           "args": [os.path.abspath(__file__), "hook"]}  # exec form: no shell, spaces in paths are fine
+    events = {e: {**cmd, "async": True, "timeout": 10} for e in HOOK_EVENTS}
+    if approve:  # waits for the tap, so not async
+        events["PermissionRequest"] = {**cmd, "timeout": APPROVE_WAIT + 15}
+    for event in set(events) | {"PermissionRequest"}:
         lst = [x for x in hooks.get(event, []) if not _our_hook(x)]  # replace an older install
-        lst.append(entry)
-        hooks[event] = lst
+        if event in events:
+            lst.append({"hooks": [events[event]]})
+        if lst:
+            hooks[event] = lst
+        else:
+            hooks.pop(event, None)
     _save_settings(settings)
-    print(f"Added TribeBuddy hooks ({', '.join(HOOK_EVENTS)}) to {SETTINGS}")
+    print(f"Added TribeBuddy hooks ({', '.join(sorted(events))}) to {SETTINGS}")
+    if approve:
+        print("Approving on the display also needs the feeder started with --approve.")
     print("Running Claude Code sessions pick them up after /hooks or a restart.")
 
 
@@ -846,6 +1241,9 @@ def install_service(extra):
     if os.path.abspath(__file__) != script:
         shutil.copyfile(os.path.abspath(__file__), script)
     cmd = [sys.executable, script, "--port", "auto", *extra]
+    # A service doesn't see your shell's variables: take the TRIBEBUDDY_* ones along (tokens,
+    # tunnel domain, ...). The file is made readable for you only.
+    env = {k: v for k, v in sorted(os.environ.items()) if k.startswith("TRIBEBUDDY_")}
     if sys.platform == "darwin":
         os.makedirs(os.path.dirname(LAUNCH_AGENT), exist_ok=True)
         with open(LAUNCH_AGENT, "wb") as f:
@@ -853,17 +1251,20 @@ def install_service(extra):
                 "Label": SERVICE_LABEL,
                 "ProgramArguments": cmd,
                 "WorkingDirectory": SERVICE_DIR,
-                "EnvironmentVariables": {"PYTHONUNBUFFERED": "1"},
+                "EnvironmentVariables": {"PYTHONUNBUFFERED": "1", **env},
                 "RunAtLoad": True,
                 "KeepAlive": True,
                 "ThrottleInterval": 10,
                 "StandardOutPath": MAC_LOG,
                 "StandardErrorPath": MAC_LOG,
             }, f)
+        os.chmod(LAUNCH_AGENT, 0o600)
         domain = f"gui/{os.getuid()}"
         subprocess.run(["launchctl", "bootout", domain, LAUNCH_AGENT], capture_output=True)
         subprocess.run(["launchctl", "bootstrap", domain, LAUNCH_AGENT], check=True)
         print(f"Installed {LAUNCH_AGENT}; the feeder runs now and at every login.")
+        if env:
+            print("Took along: " + ", ".join(env) + " (run install-service again after changing them)")
         print(f"It runs a copy in {SERVICE_DIR}: run install-service again after changing feeder.py.")
         print(f"Log: {MAC_LOG}   (tail -f {MAC_LOG})")
         print("For Claude Desktop notifications, give Full Disk Access to this Python:\n  "
@@ -874,11 +1275,16 @@ def install_service(extra):
             f.write("[Unit]\nDescription=TribeBuddy feeder (Claude usage display)\n\n"
                     "[Service]\n"
                     f"ExecStart={' '.join(json.dumps(c) for c in cmd)}\n"
-                    "Environment=PYTHONUNBUFFERED=1\nRestart=always\nRestartSec=10\n\n"
+                    "Environment=PYTHONUNBUFFERED=1\n"
+                    + "".join(f"Environment={json.dumps(f'{k}={v}')}\n" for k, v in env.items())
+                    + "Restart=always\nRestartSec=10\n\n"
                     "[Install]\nWantedBy=default.target\n")
+        os.chmod(SYSTEMD_UNIT, 0o600)
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
         subprocess.run(["systemctl", "--user", "enable", "--now", "tribebuddy.service"], check=True)
         print(f"Installed {SYSTEMD_UNIT}; the feeder runs now and at every login.")
+        if env:
+            print("Took along: " + ", ".join(env) + " (run install-service again after changing them)")
         print(f"It runs a copy in {SERVICE_DIR}: run install-service again after changing feeder.py.")
         print("Log: journalctl --user -u tribebuddy -f")
         print(f"If the board isn't found: sudo usermod -aG dialout {getpass.getuser()} (then log in again)")
@@ -934,8 +1340,10 @@ def main():
         uninstall_service()
         return
     if len(sys.argv) > 1 and sys.argv[1] in ("hook", "install-hooks", "uninstall-hooks"):
-        {"hook": hook_main, "install-hooks": install_hooks,
-         "uninstall-hooks": uninstall_hooks}[sys.argv[1]]()
+        if sys.argv[1] == "install-hooks":
+            install_hooks(sys.argv[2:])
+        else:
+            {"hook": hook_main, "uninstall-hooks": uninstall_hooks}[sys.argv[1]]()
         return
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -962,10 +1370,25 @@ def main():
                     help="address the webhook listens on; anything but localhost needs a token")
     ap.add_argument("--webhook-token", default=os.environ.get("TRIBEBUDDY_WEBHOOK_TOKEN"),
                     help="shared secret for the webhook (or set TRIBEBUDDY_WEBHOOK_TOKEN)")
-    ap.add_argument("--tunnel", choices=["ngrok"],
+    ap.add_argument("--tunnel", choices=["ngrok"], default=os.environ.get("TRIBEBUDDY_TUNNEL") or None,
                     help="make the webhook reachable from the internet (Jira, Bitbucket); needs a token")
     ap.add_argument("--tunnel-domain", default=os.environ.get("TRIBEBUDDY_TUNNEL_DOMAIN"),
                     help="your ngrok domain, e.g. discharge-gimmick-lard.ngrok-free.dev (Dashboard > Domains)")
+    ap.add_argument("--bitbucket-workspace", default=os.environ.get("TRIBEBUDDY_BITBUCKET_WORKSPACE"),
+                    help="Bitbucket Cloud workspace to follow pipelines in (e.g. tribeagency)")
+    ap.add_argument("--bitbucket-token", default=os.environ.get("TRIBEBUDDY_BITBUCKET_TOKEN"),
+                    help="Atlassian API token (read:repository, read:pipeline) or a workspace access token "
+                         "(or set TRIBEBUDDY_BITBUCKET_TOKEN)")
+    ap.add_argument("--bitbucket-email", default=os.environ.get("TRIBEBUDDY_BITBUCKET_EMAIL"),
+                    help="your Atlassian e-mail, needed with an API token (not with an access token)")
+    ap.add_argument("--bitbucket-branches", default="develop,acceptance,main",
+                    help="branches to follow, comma-separated; wildcards like release/* work")
+    ap.add_argument("--bitbucket-interval", type=float, default=60, help="seconds between pipeline checks")
+    ap.add_argument("--bitbucket-budget", type=int, default=600,
+                    help="Bitbucket API requests per hour at most (Bitbucket allows about 1000)")
+    ap.add_argument("--approve", action="store_true",
+                    help="let Claude Code permission requests be allowed/denied by tapping the display "
+                         "(also needs install-hooks --approve)")
     ap.add_argument("--no-limits", action="store_true",
                     help="don't show plan limits (skips reading Claude Code's login token)")
     args = ap.parse_args()
@@ -975,7 +1398,8 @@ def main():
     n_days = max(1, min(args.days, 14))
     port = None  # opened (and reopened after an unplug) in the main loop
     usage = Usage()
-    spool = HookSpool()
+    sessions = Sessions()
+    spool = HookSpool(sessions)
     desktop = DesktopNotifications() if not args.no_desktop else None
 
     def log(text):
@@ -988,9 +1412,40 @@ def main():
             raw = port.readline().decode(errors="replace").strip()
             if raw.startswith('{"ok"'):
                 return raw
+            board_event(raw)
             if '"ready"' in raw:
                 log("board restarted")
         return None
+
+    def board_event(raw):
+        """Lines the board sends by itself: {"event":"approve","id":...,"allow":true}."""
+        if not raw.startswith('{"event"') or not approvals:
+            return
+        try:
+            ev = json.loads(raw)
+        except ValueError:
+            return
+        if ev.get("event") == "approve" and isinstance(ev.get("id"), str):
+            approvals.decide(ev["id"], ev.get("allow") is True)
+
+    def read_events():
+        """Taps arrive between our own lines: read whatever the board sent meanwhile."""
+        nonlocal port
+        try:
+            while port is not None and port.in_waiting:
+                board_event(port.readline().decode(errors="replace").strip())
+        except OSError:
+            pass  # unplugged: the next send notices and reconnects
+
+    def write_state():
+        """Heartbeat for the PermissionRequest hook: only ask on the display when it's there."""
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(STATE_FILE + ".tmp", "w") as f:
+                json.dump({"ts": time.time(), "approve": bool(approvals), "board": port is not None}, f)
+            os.replace(STATE_FILE + ".tmp", STATE_FILE)
+        except OSError:
+            pass
 
     def connect():
         """Opens the board's port; None (and a log line once) while it isn't there."""
@@ -1060,6 +1515,15 @@ def main():
             webhook = WebhookListener(args.webhook_host, args.webhook_port, args.webhook_token, log)
         except OSError as e:  # port taken, e.g. by a second feeder
             log(f"webhook off: can't listen on {args.webhook_host}:{args.webhook_port} ({e})")
+    pipelines = None
+    if args.bitbucket_workspace:
+        if not args.bitbucket_token:
+            sys.exit("--bitbucket-workspace needs --bitbucket-token (or TRIBEBUDDY_BITBUCKET_TOKEN)")
+        branches = [b.strip() for b in args.bitbucket_branches.split(",") if b.strip()]
+        pipelines = BitbucketPipelines(args.bitbucket_workspace, args.bitbucket_token, args.bitbucket_email,
+                                       branches, max(30.0, args.bitbucket_interval), log,
+                                       budget=max(60, args.bitbucket_budget))
+        log(f"following Bitbucket pipelines in {args.bitbucket_workspace} on {', '.join(branches)}")
     tunnel = None
     if args.tunnel:
         if not args.webhook_port:
@@ -1080,11 +1544,16 @@ def main():
     log(f"usage every {args.interval:g}s from {', '.join(roots)}; "
         f"notifications from {' + '.join(sources)}. Ctrl+C to stop.")
 
+    approvals = Approvals(log) if args.approve else None
     next_scan = 0.0
     waiting = False
     while True:
         if tunnel:
             tunnel.tick()
+        if approvals:
+            write_state()
+            if port is None and not args.dry_run:
+                approvals.drop_all()  # no board: the terminal asks
         if not args.dry_run and port is None:
             port = connect()
             if port is None:
@@ -1093,7 +1562,13 @@ def main():
                 time.sleep(5)
                 continue
             next_scan = 0.0  # fresh connection (or a restarted board): send everything now
-        notes = spool.poll() + (desktop.poll() if desktop else []) + (webhook.poll() if webhook else [])
+        read_events()
+        if approvals:
+            for m in approvals.poll():  # one at a time: a rejected one goes back to the terminal
+                if send([m]) and "approve" in m:
+                    approvals.unavailable(m["approve"]["id"])
+        notes = spool.poll() + (desktop.poll() if desktop else []) + (webhook.poll() if webhook else []) \
+            + (pipelines.poll() if pipelines else [])
         if notes:
             failed = send(notes)
             if not args.dry_run:
@@ -1102,15 +1577,20 @@ def main():
                     log(f"notification ({m.get('app') or m['src']}, {m.get('prio', 'normal')}): "
                         f"{m['title']} - {m['body']}"
                         + (" [not delivered]" if failed else ""))
+        if sessions.changed and time.monotonic() < next_scan:
+            send([sessions.message()])  # a session changed state: show it now
+        if pipelines and pipelines.changed and time.monotonic() < next_scan:
+            send([pipelines.message()])
         lim = limits.message() if limits and limits.poll(wait=args.once) else None
         if lim and time.monotonic() < next_scan:
             send([lim])  # new numbers between usage scans
             if not args.dry_run:
                 log("plan limits: " + ", ".join(f"{k} {v}%" for k, v in lim["limits"].items()
-                                                if not k.endswith("_in")))
+                                                if "_" not in k))
         if time.monotonic() >= next_scan:
             usage.scan(roots)
-            msgs = usage.messages(n_days, args.limit)
+            msgs = usage.messages(n_days, args.limit) + [sessions.message()] \
+                + ([pipelines.message()] if pipelines else [])
             lim = limits.message() if limits else None
             failed = send(msgs + ([lim] if lim else []))  # limits resent too, e.g. after a replug
             if not args.dry_run:

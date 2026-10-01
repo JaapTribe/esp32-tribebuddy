@@ -4,7 +4,9 @@
 // Reads newline-delimited JSON over serial and shows it on an ILI9341 2.8" TFT (portrait).
 // Touch: tap = next page (or dismiss a notification; on the recent page, open the one tapped),
 // hold = back to overview.
-// Pages: overview, one page per model, usage per day, usage per hour (today), recent notifications.
+// Pages: overview, Claude (sessions, limit forecast), recent notifications, Bitbucket pipelines,
+// one page per model,
+// usage per day, usage per hour (today), cost per project (today).
 //
 // Line protocol (one JSON object per line, all fields optional; feeder.py sends these):
 //   Overview: {"in":123456,"out":7890,"cr":2000000,"cw":150000,"cost":4.21,
@@ -12,9 +14,18 @@
 //   Models:   {"models":[{"name":"claude-opus-4","in":1,"out":2,"cr":3,"cw":4,"cost":0.5}, ...]}
 //   Days:     {"days":[{"d":"09-24","tok":123456,"cost":1.2}, ...]}   oldest first, last = today
 //   Hours:    {"hours":[0,0,1200, ...24 values],"now":14}              index = local hour
-//   Limits:   {"limits":{"5h":42,"5h_in":4320,"7d":61,"7d_in":190000}}  plan usage in percent and
-//             seconds until each window resets (counted down here; 0 = unknown). Replaces the
-//             "limit" bar. Greyed out after 10 minutes without an update, dropped after 30.
+//   Limits:   {"limits":{"5h":42,"5h_in":4320,"7d":61,"7d_in":190000,"7d_proj":88,"5h_full":2400}}
+//             plan usage in percent and seconds until each window resets (counted down here;
+//             0 = unknown). Replaces the "limit" bar. Greyed out after 10 minutes without an
+//             update, dropped after 30. Optional forecast at the current pace: _proj = percent
+//             at the reset, _full = seconds until 100% when that comes before the reset.
+//   Projects: {"projects":[{"name":"tribe-website","tok":950545,"cost":21.96}, ...]}  today, max 6
+//   Sessions: {"sessions":[{"name":"tribe-website","state":"waiting","for":120,"msg":"..."}, ...]}
+//             Claude Code sessions, max 6. state: working / waiting / idle; for: seconds in it.
+//   Time:     {"time":1790786407}  local time as seconds since 1970 (the board has no clock)
+//   Pipelines: {"pipelines":[{"repo":"tribe-website","branch":"main","state":"failed","for":300,
+//             "num":812,"by":"Jaap"}, ...]}  latest Bitbucket run per repo/branch, newest first, max 8.
+//             state: running / paused (manual step) / passed / failed / stopped; for: seconds since.
 //   Notify:   {"notify":{"title":"TribeBuddy","body":"Needs permission: Bash","src":"code",
 //                        "app":"GitHub","prio":"high"}}
 //             src: "code" (Claude Code hook), "desktop" (Claude Desktop / Cowork) or "hook"
@@ -153,10 +164,46 @@ int nDays = 0;
 struct PlanLimits {
   int pct[2] = {-1, -1};         // -1 = not reported
   uint32_t resetIn[2] = {0, 0};  // seconds until the reset when received, 0 = unknown
+  int proj[2] = {-1, -1};        // forecast: percent at the reset, -1 = too early to tell
+  uint32_t full[2] = {0, 0};     // forecast: seconds until 100% (before the reset), 0 = not
   unsigned long rxAt = 0;
   bool valid = false;
 } lim;
 const unsigned long LIMITS_STALE_MS = 10 * 60 * 1000UL, LIMITS_DROP_MS = 30 * 60 * 1000UL;
+
+struct ProjectUsage {
+  char name[25];
+  uint64_t tok;
+  float cost;
+};
+ProjectUsage projects[MAX_MODELS];
+int nProjects = 0;
+
+struct Session {
+  char name[25];
+  char state;  // 'w' working, 'a' waiting (asked for something), 'i' idle
+  uint32_t forS;  // seconds in that state when received
+  char msg[61];
+};
+struct Pipeline {
+  char repo[25];
+  char branch[21];
+  char state;     // 'r' running, 'p' paused (manual step), 's' passed, 'f' failed, 'x' stopped
+  uint32_t forS;  // seconds since it started (running/paused) or finished, when received
+  uint32_t num;
+  char by[21];
+};
+const int MAX_PIPELINES = 8;
+Pipeline pipelines[MAX_PIPELINES];
+int nPipelines = 0;
+unsigned long pipelinesAt = 0;
+bool pipelinesValid = false;  // false: the feeder doesn't follow Bitbucket
+
+const int MAX_SESSIONS = 6;
+Session sessions[MAX_SESSIONS];
+int nSessions = 0;
+unsigned long sessionsAt = 0;  // millis() when received
+bool sessionsValid = false;
 
 uint64_t hours[24] = {0};
 int nowHour = -1;
@@ -193,6 +240,12 @@ unsigned long noticeShownAt = 0;  // when notices[0] appeared (its timer start)
 int noticeBarDrawn = 0;           // filled pixels of the progress bar already on screen
 
 // ---------- helpers ----------
+// Clock: local time from the feeder, counted on with millis()
+bool clockValid = false;
+uint32_t clockBase = 0;
+unsigned long clockAt = 0;
+uint32_t nowEpoch() { return clockBase + (millis() - clockAt) / 1000; }
+
 const char* PREFS_NS = "tribebuddy";
 
 // Settings were kept under "deskbuddy" before the rename; carry them over once.
@@ -222,10 +275,13 @@ void setContrast(bool high) {
 uint64_t totalTokens() { return u.in + u.out + u.cacheW; }
 uint64_t modelTotal(const ModelUsage& m) { return m.in + m.out + m.cacheW; }
 
-int pageCount() { return 4 + nModels; }
-int daysPage() { return 1 + nModels; }
-int hoursPage() { return 2 + nModels; }
-int recentPage() { return 3 + nModels; }
+// overview, Claude, recent, pipelines, models..., days, hours, projects
+const int CLAUDE_PAGE = 1, RECENT_PAGE = 2, PIPELINES_PAGE = 3, FIRST_MODEL_PAGE = 4;
+int recentPage() { return RECENT_PAGE; }
+int daysPage() { return FIRST_MODEL_PAGE + nModels; }
+int hoursPage() { return FIRST_MODEL_PAGE + 1 + nModels; }
+int projectsPage() { return FIRST_MODEL_PAGE + 2 + nModels; }
+int pageCount() { return FIRST_MODEL_PAGE + 3 + nModels; }
 
 void fmtTokens(uint64_t n, char* buf, size_t len) {
   double v = (double)n;
@@ -267,16 +323,18 @@ void drawSplash() {
 }
 
 // ---------- screen (portrait 240x320) ----------
+// Header: logo | page dots (100-164) | unread badge (168-186) | clock (190-220) | status dot
 void drawHeader() {
   tft.fillRect(0, 0, 240, 28, C_PANEL);
   tft.drawRGBBitmap(6, 2, tribeLogoSmall, TRIBELOGOSMALL_W, TRIBELOGOSMALL_H);
-  // Page dots between the logo and the status
   int n = pageCount();
-  int x0 = 128 - (n - 1) * 4;
+  int step = n > 1 ? min(8, 64 / (n - 1)) : 0;  // squeeze when there are many model pages
+  int x0 = 132 - (n - 1) * step / 2;
   for (int i = 0; i < n; i++) {
-    if (i == page) tft.fillCircle(x0 + i * 8, 14, 2, C_ACCENT);
-    else           tft.drawCircle(x0 + i * 8, 14, 2, C_DIM);
+    if (i == page) tft.fillCircle(x0 + i * step, 14, 2, C_ACCENT);
+    else           tft.drawCircle(x0 + i * step, 14, 2, C_DIM);
   }
+  drawUnreadBadge();
 }
 
 void drawStatus() {
@@ -289,13 +347,22 @@ void drawStatus() {
     else                { c = C_RED;   txt = "offline"; }
   }
   if (demo) { c = C_ACCENT; txt = "demo"; }
+  // The time when known (the dot's colour tells live/stale/offline), else the state in words
   char b[8];
-  snprintf(b, sizeof(b), "%7s", txt);  // fixed width, right-aligned: overwrites the old text
-  tft.fillCircle(226, 14, 5, c);
+  if (clockValid && !demo) {
+    uint32_t t = nowEpoch();
+    snprintf(b, sizeof(b), "%02u:%02u", (unsigned)(t / 3600 % 24), (unsigned)(t / 60 % 60));
+  } else {
+    snprintf(b, sizeof(b), "%5s", strcmp(txt, "offline") == 0 ? "off" : strcmp(txt, "no data") == 0 ? "--" : txt);
+  }
+  tft.fillCircle(231, 14, 4, c);
   tft.setTextSize(1);
-  tft.setTextColor(C_DIM, C_PANEL);
-  tft.setCursor(216 - 7 * 6, 10);
+  tft.setTextColor(C_TEXT, C_PANEL);
+  tft.setCursor(190, 10);
   tft.print(b);
+
+  if (page == CLAUDE_PAGE && nNotices == 0) drawClaudeTicks();  // session timers, forecast
+  if (page == PIPELINES_PAGE && nNotices == 0) drawPipelinesTicks();
 
   if (page == recentPage() && nNotices == 0) drawRecentValues();  // tick the ages
   if (page == 0 && nNotices == 0) {
@@ -544,6 +611,7 @@ struct Recent {
   char title[40];
   char body[160];
   uint8_t prio;
+  bool unread;       // not seen on the recent page yet
   unsigned long at;  // millis() when it came in
 };
 const int MAX_RECENT = 7;  // what fits on the page
@@ -568,14 +636,36 @@ void remember(const Notice& n) {
   strlcpy(r.title, n.title, sizeof(r.title));
   strlcpy(r.body, n.body, sizeof(r.body));
   r.prio = n.prio;
+  r.unread = true;
   r.at = millis();
   if (nRecent < MAX_RECENT) nRecent++;
   if (openRecent >= 0 && ++openRecent >= MAX_RECENT) openRecent = -1;  // follow the open one down
 }
 
+int unreadCount() {
+  int n = 0;
+  for (int i = 0; i < nRecent; i++) n += recent[i].unread;
+  return n;
+}
+
+// Red badge with the number of unread notifications, hidden on the recent page itself.
+void drawUnreadBadge() {
+  int n = page == RECENT_PAGE ? 0 : unreadCount();
+  tft.fillRect(166, 5, 22, 18, C_PANEL);
+  if (n == 0) return;
+  tft.fillRoundRect(168, 7, 18, 14, 7, C_RED);
+  char b[4];
+  snprintf(b, sizeof(b), "%d", n);
+  tft.setTextSize(1);
+  tft.setTextColor(0xFFFF, C_RED);
+  tft.setCursor(177 - strlen(b) * 3, 11);
+  tft.print(b);
+}
+
 // Full screen: header, title (bold), the whole message.
 void drawRecentDetail() {
-  const Recent& r = recent[openRecent];
+  Recent& r = recent[openRecent];
+  r.unread = false;
   tft.setTextSize(1);
   tft.setTextColor(prioColor(r.prio), C_BG);
   tft.setCursor(10, 38);
@@ -587,11 +677,17 @@ void drawRecentDetail() {
   label(10, 308, "tap to go back");
 }
 
-// "now", "12m ago", "3h ago", "2d ago"
+// "now", "12m ago", then with the clock "14:32" (today) or "Tue 14:32"; without it "3h ago", "2d ago"
 void fmtAgo(unsigned long ms, char* buf, size_t len) {
+  static const char* dow[7] = {"Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"};  // 1-1-1970: Thu
   unsigned long s = ms / 1000;
   if (s < 60)         snprintf(buf, len, "now");
   else if (s < 3600)  snprintf(buf, len, "%lum ago", s / 60);
+  else if (clockValid) {
+    uint32_t now = nowEpoch(), t = now - s;
+    if (t / 86400 == now / 86400) snprintf(buf, len, "%02u:%02u", (unsigned)(t / 3600 % 24), (unsigned)(t / 60 % 60));
+    else snprintf(buf, len, "%s %02u:%02u", dow[t / 86400 % 7], (unsigned)(t / 3600 % 24), (unsigned)(t / 60 % 60));
+  }
   else if (s < 86400) snprintf(buf, len, "%luh ago", s / 3600);
   else                snprintf(buf, len, "%lud ago", s / 86400);
 }
@@ -612,8 +708,9 @@ void drawRecentStatic() {
     uint16_t c = prioColor(r.prio);
     tft.fillRect(10, y, 3, 28, c);  // priority stripe
     tft.setTextSize(1);
+    if (r.unread) tft.fillCircle(20, y + 3, 2, C_TEXT);  // new since the last visit
     tft.setTextColor(c, C_BG);
-    tft.setCursor(18, y);
+    tft.setCursor(26, y);
     tft.print(r.from);
     tft.setTextColor(C_TEXT);
     drawWrapped(18, y + 10, 212, 1, 18, r.title[0] ? r.title : r.body);  // one line, "..." when longer
@@ -626,32 +723,208 @@ void drawRecentValues() {
   char b[12], r[12];
   if (openRecent >= 0) {
     fmtAgo(millis() - recent[openRecent].at, b, sizeof(b));
-    snprintf(r, sizeof(r), "%8s", b);
-    printAt(230 - 8 * 6, 38, 8 * 6, 8, 1, C_DIM, r);
+    snprintf(r, sizeof(r), "%9s", b);
+    printAt(230 - 9 * 6, 38, 9 * 6, 8, 1, C_DIM, r);
     return;
   }
   for (int i = 0; i < nRecent; i++) {
     fmtAgo(millis() - recent[i].at, b, sizeof(b));
-    snprintf(r, sizeof(r), "%8s", b);  // right-aligned against the edge
-    printAt(230 - 8 * 6, RC_Y + i * RC_STEP, 8 * 6, 8, 1, C_DIM, r);
+    snprintf(r, sizeof(r), "%9s", b);  // right-aligned against the edge
+    printAt(230 - 9 * 6, RC_Y + i * RC_STEP, 9 * 6, 8, 1, C_DIM, r);
+  }
+}
+
+// --- Claude: sessions and the limit forecast ---
+const int CS_Y = 52, CS_STEP = 30, CS_ROWS = 5;
+
+uint16_t sessionColor(char st) { return st == 'a' ? C_AMBER : st == 'w' ? C_GREEN : C_DIM; }
+
+void drawClaudeStatic() {
+  label(10, 38, "CLAUDE CODE SESSIONS");
+  tft.drawFastHLine(10, 212, 220, C_PANEL);
+  label(10, 222, "PLAN LIMITS AT THIS PACE");
+}
+
+// Rows: dot + project + "waiting 3m" / what it's doing. Redrawn when new session data comes in.
+void drawClaudeValues() {
+  tft.fillRect(0, CS_Y - 2, 240, CS_ROWS * CS_STEP, C_BG);
+  if (!sessionsValid || nSessions == 0) {
+    printAt(10, CS_Y + 6, 220, 8, 1, C_DIM, sessionsValid ? "No sessions running" : "No session data yet");
+    label(10, CS_Y + 20, "run feeder.py install-hooks, then");
+    label(10, CS_Y + 32, "restart Claude Code");
+  }
+  for (int i = 0; i < min(nSessions, CS_ROWS); i++) {
+    const Session& ss = sessions[i];
+    int y = CS_Y + i * CS_STEP;
+    tft.fillCircle(14, y + 3, 3, sessionColor(ss.state));
+    char b[40];
+    strlcpy(b, ss.name, 25);
+    printAt(22, y, 140, 8, 1, C_TEXT, b);
+    strlcpy(b, ss.msg, 35);  // 35 chars fit next to the dot
+    printAt(22, y + 12, 208, 8, 1, C_DIM, b);
+  }
+  drawClaudeTicks();
+}
+
+// What counts on by itself: time in each state, the forecast countdown. Every second.
+void drawClaudeTicks() {
+  char b[40], t[16];
+  unsigned long el = (millis() - sessionsAt) / 1000;
+  for (int i = 0; i < min(nSessions, CS_ROWS); i++) {
+    const Session& ss = sessions[i];
+    uint32_t sec = ss.forS + el;
+    if (sec < 60) snprintf(t, sizeof(t), "%us", (unsigned)sec);
+    else fmtCountdown(sec, t, sizeof(t));
+    snprintf(b, sizeof(b), "%s %s", ss.state == 'a' ? "waiting" : ss.state == 'w' ? "working" : "idle", t);
+    char r[16];
+    snprintf(r, sizeof(r), "%13s", b);
+    printAt(230 - 13 * 6, CS_Y + i * CS_STEP, 13 * 6, 8, 1, sessionColor(ss.state), r);
+  }
+
+  static const char* names[2] = {"5H", "WK"};
+  unsigned long lel = (millis() - lim.rxAt) / 1000;
+  for (int i = 0; i < 2; i++) {
+    int y = 238 + i * 16;
+    uint16_t c = C_TEXT;
+    if (!lim.valid || lim.pct[i] < 0) {
+      snprintf(b, sizeof(b), "%s   -", names[i]);
+      c = C_DIM;
+    } else if (lim.full[i] > lel) {
+      fmtCountdown(lim.full[i] - lel, t, sizeof(t));
+      snprintf(b, sizeof(b), "%s %3d%%  full in %s!", names[i], lim.pct[i], t);
+      c = C_RED;
+    } else if (lim.full[i]) {
+      snprintf(b, sizeof(b), "%s %3d%%  full about now", names[i], lim.pct[i]);
+      c = C_RED;
+    } else if (lim.proj[i] >= 0) {
+      snprintf(b, sizeof(b), "%s %3d%%  -> %d%% at reset", names[i], lim.pct[i], lim.proj[i]);
+      c = levelColor(lim.proj[i] / 100.0f);
+    } else {
+      snprintf(b, sizeof(b), "%s %3d%%  too early to tell", names[i], lim.pct[i]);
+      c = C_DIM;
+    }
+    printAt(10, y, 220, 8, 1, limitsStale() ? C_DIM : c, b);
+  }
+  if (lim.valid) label(10, 276, "pace = average since the window started");
+}
+
+// --- Bitbucket pipelines ---
+const int PL_Y = 52, PL_STEP = 30;
+
+uint16_t pipelineColor(char st) {
+  switch (st) {
+    case 'r': return C_ACCENT;
+    case 'p': return C_AMBER;
+    case 's': return C_GREEN;
+    case 'f': return C_RED;
+    default:  return C_DIM;
+  }
+}
+
+void drawPipelinesStatic() {
+  label(10, 38, "PIPELINES");
+  if (!pipelinesValid) {
+    printAt(10, 150, 220, 16, 2, C_DIM, "Not set up");
+    label(10, 174, "start the feeder with");
+    label(10, 186, "--bitbucket-workspace (README)");
+  } else if (nPipelines == 0) {
+    printAt(10, 150, 220, 16, 2, C_DIM, "No runs yet");
+    label(10, 174, "on the branches being followed");
+  }
+}
+
+// Rows: dot + repo + status/time, and "main  #812  Jaap" below. Redrawn on new data.
+void drawPipelinesValues() {
+  if (!pipelinesValid || nPipelines == 0) return;
+  for (int i = 0; i < nPipelines; i++) {
+    const Pipeline& pl = pipelines[i];
+    int y = PL_Y + i * PL_STEP;
+    char b[48];
+    strlcpy(b, pl.repo, 19);  // 18 chars leave room for the status (the feeder shortens to 18)
+    printAt(22, y, 110, 8, 1, C_TEXT, b);
+    snprintf(b, sizeof(b), "%s  #%u%s%s", pl.branch, (unsigned)pl.num, pl.by[0] ? "  " : "", pl.by);
+    b[35] = 0;  // 35 chars fit next to the dot
+    printAt(22, y + 12, 208, 8, 1, C_DIM, b);
+  }
+  drawPipelinesTicks();
+}
+
+// Every second: times, and the dot of a running pipeline blinks.
+void drawPipelinesTicks() {
+  if (!pipelinesValid) return;
+  unsigned long el = (millis() - pipelinesAt) / 1000;
+  bool on = (millis() / 1000) % 2;
+  for (int i = 0; i < nPipelines; i++) {
+    const Pipeline& pl = pipelines[i];
+    int y = PL_Y + i * PL_STEP;
+    uint16_t c = pipelineColor(pl.state);
+    tft.fillCircle(14, y + 3, 3, pl.state == 'r' && !on ? C_BG : c);
+    if (pl.state != 'r') tft.drawCircle(14, y + 3, 3, c);
+    char t[16], b[24], r[24];
+    uint32_t sec = pl.forS + el;
+    if (pl.state == 'r' || pl.state == 'p') {
+      if (sec < 60) snprintf(t, sizeof(t), "%us", (unsigned)sec);
+      else fmtCountdown(sec, t, sizeof(t));
+      snprintf(b, sizeof(b), "%s %s", pl.state == 'r' ? "running" : "paused", t);
+    } else {
+      fmtAgo(sec * 1000UL, t, sizeof(t));
+      snprintf(b, sizeof(b), "%s %s", pl.state == 's' ? "ok" : pl.state == 'f' ? "FAILED" : "stopped", t);
+    }
+    snprintf(r, sizeof(r), "%16s", b);
+    printAt(230 - 16 * 6, y, 16 * 6, 8, 1, c, r);
+  }
+}
+
+// --- today by project ---
+void drawProjectsStatic() {
+  if (nProjects == 0) { drawNoData("TODAY BY PROJECT"); return; }
+  label(10, 38, "TODAY BY PROJECT");
+}
+
+void drawProjectsValues() {
+  if (nProjects == 0) return;
+  float total = 0, mx = 0.01f;
+  for (int i = 0; i < nProjects; i++) { total += projects[i].cost; mx = max(mx, projects[i].cost); }
+  char b[40];
+  snprintf(b, sizeof(b), "$%.2f", total);
+  printAt(230 - 10 * 6, 38, 10 * 6, 8, 1, C_TEXT, b);  // right of the heading
+  for (int i = 0; i < nProjects; i++) {
+    const ProjectUsage& pr = projects[i];
+    int y = 54 + i * 42;
+    printAt(10, y, 150, 8, 1, C_TEXT, pr.name);
+    snprintf(b, sizeof(b), "%9s", "");
+    char c[16];
+    snprintf(c, sizeof(c), "$%.2f", pr.cost);
+    snprintf(b, sizeof(b), "%9s", c);
+    printAt(230 - 9 * 6, y, 9 * 6, 8, 1, C_ACCENT, b);
+    drawHBar(10, y + 12, 220, pr.cost / mx, C_ACCENT);
+    fmtTokens(pr.tok, c, sizeof(c));
+    snprintf(b, sizeof(b), "%s tokens", c);
+    printAt(10, y + 24, 220, 8, 1, C_DIM, b);
   }
 }
 
 // What the current page shows, so updates for other pages don't redraw it.
-enum { SHOWS_OVERVIEW = 1, SHOWS_MODELS = 2, SHOWS_DAYS = 4, SHOWS_HOURS = 8, SHOWS_RECENT = 16 };
+enum { SHOWS_OVERVIEW = 1, SHOWS_MODELS = 2, SHOWS_DAYS = 4, SHOWS_HOURS = 8, SHOWS_RECENT = 16,
+       SHOWS_CLAUDE = 32, SHOWS_PROJECTS = 64, SHOWS_PIPELINES = 128 };
 int pageShows() {
-  if (page == 0)           return SHOWS_OVERVIEW;
-  if (page <= nModels)     return SHOWS_MODELS;
-  if (page == daysPage())  return SHOWS_DAYS;
-  if (page == hoursPage()) return SHOWS_HOURS;
-  return SHOWS_RECENT;
+  if (page == 0)                          return SHOWS_OVERVIEW;
+  if (page == CLAUDE_PAGE)                return SHOWS_CLAUDE;
+  if (page == RECENT_PAGE)                return SHOWS_RECENT;
+  if (page == PIPELINES_PAGE)             return SHOWS_PIPELINES;
+  if (page < FIRST_MODEL_PAGE + nModels)  return SHOWS_MODELS;
+  if (page == daysPage())                 return SHOWS_DAYS;
+  if (page == hoursPage())                return SHOWS_HOURS;
+  return SHOWS_PROJECTS;
 }
 
 bool pageHasData() {
   switch (pageShows()) {
-    case SHOWS_DAYS:  return nDays > 0;
-    case SHOWS_HOURS: return hoursValid;
-    default:          return true;
+    case SHOWS_DAYS:     return nDays > 0;
+    case SHOWS_HOURS:    return hoursValid;
+    case SHOWS_PROJECTS: return nProjects > 0;
+    case SHOWS_PIPELINES: return pipelinesValid && nPipelines > 0;
+    default:             return true;
   }
 }
 
@@ -660,10 +933,13 @@ bool drawnWithData = false;  // whether the static layer was drawn in the "has d
 void drawContent() {
   switch (pageShows()) {
     case SHOWS_OVERVIEW: drawOverviewValues(); break;
-    case SHOWS_MODELS:   drawModelValues(page - 1); break;
+    case SHOWS_MODELS:   drawModelValues(page - FIRST_MODEL_PAGE); break;
     case SHOWS_DAYS:     drawDaysValues(); break;
     case SHOWS_HOURS:    drawHoursValues(); break;
     case SHOWS_RECENT:   drawRecentValues(); break;
+    case SHOWS_CLAUDE:   drawClaudeValues(); break;
+    case SHOWS_PROJECTS: drawProjectsValues(); break;
+    case SHOWS_PIPELINES: drawPipelinesValues(); break;
   }
 }
 
@@ -677,6 +953,9 @@ void drawPage() {
     case SHOWS_DAYS:     drawDaysStatic(); break;
     case SHOWS_HOURS:    drawHoursStatic(); break;
     case SHOWS_RECENT:   drawRecentStatic(); break;
+    case SHOWS_CLAUDE:   drawClaudeStatic(); break;
+    case SHOWS_PROJECTS: drawProjectsStatic(); break;
+    case SHOWS_PIPELINES: drawPipelinesStatic(); break;
   }
   drawnWithData = pageHasData();
   drawContent();
@@ -842,6 +1121,7 @@ void pushNotice(const char* title, const char* body, const char* src, uint16_t t
   }
   notices[at] = nw;
   remember(nw);
+  drawUnreadBadge();
   nNotices++;
   if (nNotices == 1) noticeShownAt = millis();  // queued ones start their timer when shown
   if (prio != PRIO_LOW) blinkUntil = millis() + (prio == PRIO_HIGH ? 3000 : 1200);
@@ -887,6 +1167,7 @@ void refresh(int changed) {
 }
 
 void setPage(int p) {
+  if (page == RECENT_PAGE) for (int i = 0; i < nRecent; i++) recent[i].unread = false;  // seen
   openRecent = -1;
   int n = pageCount();
   page = ((p % n) + n) % n;
@@ -914,6 +1195,11 @@ void resetAll() {
   nNotices = 0;
   nRecent = 0;
   openRecent = -1;
+  nProjects = 0;
+  nSessions = 0;
+  sessionsValid = false;
+  nPipelines = 0;
+  pipelinesValid = false;
   lim = PlanLimits();
 }
 
@@ -977,14 +1263,16 @@ void handleLine(char* line) {
 
   if (doc["limits"].is<JsonObject>()) {
     JsonObject o = doc["limits"].as<JsonObject>();
-    static const char* keys[2][2] = {{"5h", "5h_in"}, {"7d", "7d_in"}};
+    static const char* keys[2][4] = {{"5h", "5h_in", "5h_proj", "5h_full"}, {"7d", "7d_in", "7d_proj", "7d_full"}};
     for (int i = 0; i < 2; i++) {
       lim.pct[i] = o[keys[i][0]].isNull() ? -1 : constrain(o[keys[i][0]].as<int>(), 0, 100);
       lim.resetIn[i] = o[keys[i][1]] | 0UL;
+      lim.proj[i] = o[keys[i][2]] | -1;
+      lim.full[i] = o[keys[i][3]] | 0UL;
     }
     lim.rxAt = millis();
     lim.valid = true;
-    refresh(SHOWS_OVERVIEW);
+    refresh(SHOWS_OVERVIEW | SHOWS_CLAUDE);
     Serial.println("{\"ok\":true}");
     return;
   }
@@ -1027,6 +1315,55 @@ void handleLine(char* line) {
       x.tok = d["tok"] | 0ULL;
       x.cost = d["cost"] | 0.0f;
     }
+  }
+  if (doc["pipelines"].is<JsonArray>()) {
+    changed |= SHOWS_PIPELINES;
+    nPipelines = 0;
+    for (JsonObject o : doc["pipelines"].as<JsonArray>()) {
+      if (nPipelines >= MAX_PIPELINES) break;
+      Pipeline& x = pipelines[nPipelines++];
+      strlcpy(x.repo, o["repo"] | "?", sizeof(x.repo));
+      strlcpy(x.branch, o["branch"] | "?", sizeof(x.branch));
+      const char* st = o["state"] | "stopped";
+      x.state = strcmp(st, "running") == 0 ? 'r' : strcmp(st, "paused") == 0 ? 'p'
+              : strcmp(st, "passed") == 0 ? 's' : strcmp(st, "failed") == 0 ? 'f' : 'x';
+      x.forS = o["for"] | 0UL;
+      x.num = o["num"] | 0UL;
+      strlcpy(x.by, o["by"] | "", sizeof(x.by));
+    }
+    pipelinesAt = millis();
+    pipelinesValid = true;
+  }
+  if (doc["projects"].is<JsonArray>()) {
+    changed |= SHOWS_PROJECTS;
+    nProjects = 0;
+    for (JsonObject o : doc["projects"].as<JsonArray>()) {
+      if (nProjects >= MAX_MODELS) break;
+      ProjectUsage& x = projects[nProjects++];
+      strlcpy(x.name, o["name"] | "?", sizeof(x.name));
+      x.tok = o["tok"] | 0ULL;
+      x.cost = o["cost"] | 0.0f;
+    }
+  }
+  if (doc["sessions"].is<JsonArray>()) {
+    changed |= SHOWS_CLAUDE;
+    nSessions = 0;
+    for (JsonObject o : doc["sessions"].as<JsonArray>()) {
+      if (nSessions >= MAX_SESSIONS) break;
+      Session& x = sessions[nSessions++];
+      strlcpy(x.name, o["name"] | "?", sizeof(x.name));
+      const char* st = o["state"] | "idle";
+      x.state = strcmp(st, "waiting") == 0 ? 'a' : strcmp(st, "working") == 0 ? 'w' : 'i';
+      x.forS = o["for"] | 0UL;
+      strlcpy(x.msg, o["msg"] | "", sizeof(x.msg));
+    }
+    sessionsAt = millis();
+    sessionsValid = true;
+  }
+  if (!doc["time"].isNull()) {
+    clockBase = doc["time"].as<uint32_t>();
+    clockAt = millis();
+    clockValid = true;
   }
   if (doc["hours"].is<JsonArray>()) {
     changed |= SHOWS_HOURS;

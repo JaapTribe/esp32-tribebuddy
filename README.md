@@ -94,7 +94,8 @@ on macOS, `journalctl --user -u tribebuddy -f` on Linux. On Linux you may need
 ## 5. Notifications
 
 **Claude Code** — add the hooks once; they queue an event when Claude needs permission or
-finishes:
+finishes, and keep the sessions on the Claude page up to date (session start/end, prompt, tool
+use). Run it again after updating `feeder.py` to pick up new hooks:
 
 ```sh
 python3 feeder.py install-hooks        # writes to ~/.claude/settings.json (backup kept)
@@ -177,6 +178,66 @@ local posts need it too. For the service:
 If ngrok stops (network change, sleep) the feeder restarts it: after 10 seconds, backing off
 to every 5 minutes while it keeps failing.
 
+## Bitbucket Pipelines
+
+The feeder can follow Bitbucket Pipelines across a whole workspace through the Bitbucket API —
+no webhooks or `bitbucket-pipelines.yml` changes per repository, and no tunnel needed.
+
+1. Create an API token at [id.atlassian.com](https://id.atlassian.com/manage-profile/security/api-tokens)
+   → "Create API token with scopes" → Bitbucket, with the scopes `read:repository:bitbucket` and
+   `read:pipeline:bitbucket`. (A workspace access token works too; then leave out the e-mail.)
+2. Run the feeder with it:
+
+```sh
+python3 feeder.py --port auto --bitbucket-workspace <workspace> \
+  --bitbucket-email <you@company.com> --bitbucket-token <token>
+```
+
+The workspace is the part after `bitbucket.org/` in your repository URLs. By default it follows
+`develop`, `acceptance` and `main`; change that with `--bitbucket-branches develop,main,release/*`.
+These can also come from environment variables (see "Settings in environment variables" below):
+`TRIBEBUDDY_BITBUCKET_TOKEN`, `TRIBEBUDDY_BITBUCKET_EMAIL` and `TRIBEBUDDY_BITBUCKET_WORKSPACE`.
+
+What you get:
+
+- The **Pipelines** page: the latest run per repo and branch, newest first — a blinking dot while
+  it runs, amber when it waits for a manual step (a deploy), green passed, red failed, grey stopped.
+- A notification when a run changes: running (low), waiting for a manual step (normal), passed
+  (low), **failed (high)**, stopped (low). Tap it on the recent page for the link to the run.
+
+Bitbucket has no workspace-wide list of pipelines, so the feeder checks repositories one by one,
+within `--bitbucket-budget` requests an hour (default 600; Bitbucket allows about 1000):
+
+- At start it checks every repository once to fill the page (one request per repository, a
+  minute or two for ~170). That first round gives no notifications.
+- Then every minute (`--bitbucket-interval`): repositories with a run in the last 12 hours (any
+  branch) or one still going, plus others in rotation with what's left of the budget.
+
+A repository with recent activity is followed within a minute. One that has been quiet for over
+12 hours is picked up by the rotation: with ~170 repositories and many active ones, that can
+take up to an hour; raise `--bitbucket-budget` to make it faster. Pull request pipelines aren't
+followed, and branches must match exactly (`release/acceptance` needs `release/*` or its own
+name in `--bitbucket-branches`).
+
+## Settings in environment variables
+
+Tokens and other settings can be kept out of the command line with environment variables, for
+example in `~/.zshrc`:
+
+```sh
+export TRIBEBUDDY_TUNNEL=ngrok
+export TRIBEBUDDY_TUNNEL_DOMAIN=<your-domain>.ngrok-free.dev
+export TRIBEBUDDY_WEBHOOK_TOKEN=<secret>
+export TRIBEBUDDY_BITBUCKET_WORKSPACE=<workspace>
+export TRIBEBUDDY_BITBUCKET_EMAIL=<you@company.com>
+export TRIBEBUDDY_BITBUCKET_TOKEN=<api token>
+```
+
+A command-line option wins over its variable. The service doesn't see your shell's variables, so
+`install-service` takes every `TRIBEBUDDY_*` variable that is set at that moment along into the
+service (macOS: the LaunchAgent file, Linux: the systemd unit; both readable for you only).
+After changing one, open a new terminal (or `source ~/.zshrc`) and run `install-service` again.
+
 ## Plan limits
 
 The `5H` and `WK` rows show how much of your Claude plan's 5-hour and weekly limit you've used,
@@ -194,8 +255,17 @@ the same numbers as `/usage` in Claude Code, with a countdown to each reset.
 - **Tap**: next page, or dismiss a notification. On the recent notifications page, tap a row to
   read the whole message, and tap again to go back; tap the heading to go to the next page.
 - **Hold** (0.7 s or longer): back to the overview.
-- Pages: overview, one per model, last 14 days, today by hour, recent notifications (the
-  last 7, newest first, with how long ago; cleared when the board restarts).
+- Pages, in this order:
+  - **Overview**: today's tokens and cost, plan limits.
+  - **Claude**: your Claude Code sessions (waiting / working / idle, for how long, what about),
+    and the plan limits at the current pace ("-> 38% at reset", or "full in 1d04h!" in red when
+    you'd run out before the reset).
+  - **Recent notifications**: the last 7, newest first (cleared when the board restarts).
+  - **Pipelines**: the latest Bitbucket Pipelines run per repo and branch (see below).
+  - One page per model, the last 14 days, today by hour.
+  - **Today by project**: cost and tokens per project folder.
+- Header: page dots, a red badge with the number of unread notifications (cleared when you've
+  seen the recent page), the time, and the status dot (green live, amber stale, red offline).
 
 Board commands, sent with `python3 feeder.py send <command> --port auto` (stop the service first)
 or typed in a serial monitor:
