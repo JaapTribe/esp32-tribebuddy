@@ -7,3 +7,4 @@ Adafruit GFX Library
 Adafruit ILI9341
 ArduinoJson
 Adafruit FT6206 Library
+TJpg_Decoder

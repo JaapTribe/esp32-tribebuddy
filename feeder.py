@@ -18,6 +18,15 @@ Notifications, shown as a card on the display until tapped:
     without it the feeder prints a hint and carries on with the rest.
   * Anything else: POST to the webhook, http://localhost:8787/notify (see WebhookListener).
 
+Apps on the display besides Development (Claude usage, pipelines):
+  * 3D Printer: a Bambu Lab printer's status, speed profile and camera, over the local network
+    (--printer-host/--printer-serial/--printer-code; see BambuPrinter).
+  * Jira: your open issues from a JQL search (--jira-site/--jira-token; see JiraWork).
+  * Calendar: your agenda from ICS feeds, with a notification 5 minutes before each meeting or
+    reminder (--calendar-ics; see CalendarFeed).
+  * Settings (brightness, apps on the home screen, contrast): --brightness/--apps/--contrast or
+    the display's Settings page.
+
     pip install pyserial
     python3 feeder.py install-hooks            # once: add the Claude Code hooks
     python3 feeder.py                          # Wokwi simulator (rfc2217://localhost:4000)
@@ -28,6 +37,7 @@ Notifications, shown as a card on the display until tapped:
     python3 feeder.py send gamma --port ...    # send a command: demo, reset, flip, contrast, gamma, calibrate
     python3 feeder.py --port auto              # find the board by its USB chip, reconnect on replug
     python3 feeder.py install-service          # start at login (macOS LaunchAgent / systemd --user)
+                                               # settings/tokens: in .env next to this script
     python3 feeder.py uninstall-service
 
 Costs are estimates from public list prices; they ignore plan discounts and subscriptions.
@@ -44,8 +54,12 @@ import os
 import plistlib
 import re
 import secrets
+import select
 import shutil
+import socket
 import sqlite3
+import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -83,6 +97,7 @@ MAX_MODELS = 6  # must match sketch.ino
 LINE_GAP = 0.02  # extra pause between lines; the board's reply is the real pacing
 REPLY_TIMEOUT = 2.0  # seconds to wait for the board's {"ok":...} after each line
 TICK = 1.0  # main loop period; usage is rescanned every --interval seconds
+PRINTER_GAP = 2.0  # seconds between printer updates at most (it reports every second while printing)
 
 DESKTOP_APPS = ["com.anthropic.claudefordesktop"]  # Claude Desktop (chat, Cowork, Code tab)
 NOTIFY_DB = os.path.expanduser("~/Library/Group Containers/group.com.apple.usernoted/db2/db")
@@ -861,6 +876,732 @@ class BitbucketPipelines:
                                "num": r["num"] or 0, "by": to_ascii(r["by"], 20)} for r in runs]}
 
 
+def fit_jpeg(jpg, width, max_height, max_bytes):
+    """Scales a camera JPEG to the display width, as a baseline JPEG the board can decode, within
+    max_bytes: with Pillow when it's installed, else with macOS's sips."""
+    try:
+        from PIL import Image
+    except ImportError:
+        Image = None
+    if Image:
+        import io
+        img = Image.open(io.BytesIO(jpg)).convert("RGB")
+        img = img.resize((width, min(max_height, round(img.height * width / img.width))), Image.LANCZOS)
+        for q in (80, 65, 50, 35):
+            out = io.BytesIO()
+            img.save(out, "JPEG", quality=q)  # baseline: the board's decoder can't do progressive
+            if out.tell() <= max_bytes:
+                break
+        return out.getvalue()
+    if sys.platform == "darwin":
+        with tempfile.TemporaryDirectory() as d:
+            src, dst = os.path.join(d, "in.jpg"), os.path.join(d, "out.jpg")
+            with open(src, "wb") as f:
+                f.write(jpg)
+            for q in ("70", "50", "35"):
+                subprocess.run(["sips", "--resampleWidth", str(width), "-s", "formatOptions", q, src,
+                                "--out", dst], capture_output=True, check=True, timeout=20)
+                with open(dst, "rb") as f:
+                    data = f.read()
+                if len(data) <= max_bytes:
+                    break
+            return data
+    raise RuntimeError("camera needs Pillow: pip install pillow")
+
+
+class BambuPrinter:
+    """A Bambu Lab printer (P1S, P1P, X1, A1) on the local network: status and the speed profile
+    over MQTT, and camera snapshots. Talks to the printer directly: MQTT over TLS on port 8883 as
+    user "bblp" with the printer's access code; no Bambu account or cloud involved. The printer
+    has a self-signed certificate, so it isn't verified: use this on a network you trust.
+
+    The printer screen shows the IP address and access code (Settings > WLAN / Network) and the
+    serial number (Settings > Device). The camera (port 6000) needs "LAN Only Liveview" on
+    (printer Settings > Network) on newer firmware, and serves one client at a time.
+
+    A small MQTT 3.1.1 client is built in (CONNECT, SUBSCRIBE, PUBLISH at QoS 0/1, PING), so this
+    needs no extra package. P1 printers only report what changed; a full report (pushall) is
+    asked for on connecting and every PUSHALL_EVERY seconds. Runs in a thread.
+    """
+
+    PORT, CAMERA_PORT = 8883, 6000
+    KEEPALIVE = 30
+    PUSHALL_EVERY = 1800  # P1 firmware doesn't like this more often than every few minutes
+    SPEEDS = {1: "silent", 2: "standard", 3: "sport", 4: "ludicrous"}
+    SNAP_BYTES = 20000  # board buffer is 24 KB
+    # Notification per state change: (title, body, priority); job name filled in
+    EVENTS = {"FINISH": ("Print finished", "{job} is done", "normal"),
+              "FAILED": ("Print FAILED", "{job} failed", "high"),
+              "PAUSE": ("Print paused", "{job} paused (filament, error or by hand)", "normal"),
+              "PREPARE": ("Print started", "{job} is starting", "low")}
+
+    def __init__(self, host, serial, code, name, log):
+        self.host, self.serial, self.code, self.name, self.log = host, serial, code, name, log
+        self.state = {}         # merged "print" reports
+        self.online = False
+        self.changed = False
+        self.notices = []
+        self.lock = threading.Lock()       # state, notices
+        self.send_lock = threading.Lock()  # socket writes (main thread: speed; ours: ping)
+        self.sock, self.last_tx = None, 0.0
+        self.last_error = None
+        self.gcode_state = None  # for state-change notifications; None until the first report
+        self.snap, self.snap_thread = None, None
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    # --- MQTT ---
+    @staticmethod
+    def _packet(kind, body):
+        n, length = len(body), b""
+        while True:  # remaining length: 7 bits per byte, high bit = more
+            n, b = divmod(n, 128)
+            length += bytes([b | (0x80 if n else 0)])
+            if not n:
+                break
+        return bytes([kind]) + length + body
+
+    @staticmethod
+    def _str(s):
+        b = s.encode()
+        return struct.pack(">H", len(b)) + b
+
+    @staticmethod
+    def _recv(s, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = s.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("connection closed by the printer")
+            buf += chunk
+        return buf
+
+    def _read(self, s):
+        kind = self._recv(s, 1)[0]
+        n, shift = 0, 0
+        while True:
+            b = self._recv(s, 1)[0]
+            n |= (b & 0x7F) << shift
+            shift += 7
+            if not b & 0x80:
+                break
+            if shift > 21:
+                raise ConnectionError("malformed MQTT packet")
+        return kind, self._recv(s, n)
+
+    def _send(self, data):
+        with self.send_lock:
+            if self.sock is None:
+                raise ConnectionError("not connected to the printer")
+            self.sock.sendall(data)
+            self.last_tx = time.monotonic()
+
+    def _publish(self, obj):
+        self._send(self._packet(0x30, self._str(f"device/{self.serial}/request") + json.dumps(obj).encode()))
+
+    def _connect(self):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE  # self-signed printer certificate
+        s = ctx.wrap_socket(socket.create_connection((self.host, self.PORT), timeout=10),
+                            server_hostname=self.host)
+        body = self._str("MQTT") + bytes([4, 0xC2]) + struct.pack(">H", self.KEEPALIVE) \
+            + self._str("tribebuddy-" + secrets.token_hex(4)) + self._str("bblp") + self._str(self.code)
+        s.sendall(self._packet(0x10, body))  # CONNECT: user + password, clean session
+        kind, data = self._read(s)
+        if kind >> 4 != 2 or len(data) < 2 or data[1] != 0:
+            rc = data[1] if len(data) > 1 else -1
+            s.close()
+            raise ConnectionError({4: "wrong access code", 5: "not authorized"}.get(rc, f"refused ({rc})"))
+        s.sendall(self._packet(0x82, struct.pack(">H", 1) + self._str(f"device/{self.serial}/report") + b"\0"))
+        return s
+
+    def _loop(self):
+        backoff = 5
+        while True:
+            try:
+                s = self._connect()
+                with self.send_lock:
+                    self.sock, self.last_tx = s, time.monotonic()
+                self._set_online(True)
+                self.log(f"printer connected: {self.host}")
+                self.last_error, backoff = None, 5
+                self._publish({"pushing": {"sequence_id": "0", "command": "pushall"}})
+                pushed = time.monotonic()
+                while True:
+                    # SSL may hold decrypted bytes select() doesn't see: check pending() first
+                    if s.pending() or select.select([s], [], [], 1.0)[0]:
+                        kind, data = self._read(s)
+                        if kind >> 4 == 3:
+                            self._on_publish(kind, data)
+                        elif kind >> 4 == 9 and data[-1:] == b"\x80":
+                            raise ConnectionError(f"subscription refused: is {self.serial} the right serial number?")
+                    now = time.monotonic()
+                    if now - pushed > self.PUSHALL_EVERY:
+                        self._publish({"pushing": {"sequence_id": "0", "command": "pushall"}})
+                        pushed = now
+                    if now - self.last_tx > self.KEEPALIVE / 2:
+                        self._send(b"\xc0\x00")  # PINGREQ
+            except Exception as e:  # network, TLS, refused, printer off
+                err = str(e) or type(e).__name__
+                with self.send_lock:
+                    if self.sock:
+                        try:
+                            self.sock.close()
+                        except OSError:
+                            pass
+                    self.sock = None
+                if self.online or err != self.last_error:
+                    self.log(f"printer unavailable: {err}; retrying in {backoff}s")
+                self.last_error = err
+                self._set_online(False)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 120)
+
+    def _on_publish(self, kind, data):
+        n = struct.unpack(">H", data[:2])[0]
+        pos = 2 + n
+        if (kind >> 1) & 3:  # QoS 1/2: packet id, acknowledge it
+            pid = data[pos:pos + 2]
+            pos += 2
+            self._send(b"\x40\x02" + pid)
+        try:
+            p = json.loads(data[pos:]).get("print")
+        except (ValueError, AttributeError):
+            return
+        if not isinstance(p, dict):
+            return
+        if p.get("command") not in (None, "push_status"):  # an answer to a command, not status
+            self._on_answer(p)
+            return
+        with self.lock:
+            before = self._summary()
+            self.state.update({k: v for k, v in p.items() if k not in ("command", "sequence_id", "msg")})
+            after = self._summary()
+            self.changed |= before != after
+            st = self.state.get("gcode_state")
+            if st and st != self.gcode_state:
+                if self.gcode_state is not None and st in self.EVENTS:
+                    title, body, prio = self.EVENTS[st]
+                    self.notices.append(notice(title, body.format(job=after["job"] or "The print"), "hook",
+                                               self.name, prio))
+                self.gcode_state = st
+
+    # Firmware with "Authorization Control" (2025) refuses commands from anything but Bambu's own
+    # software unless the printer is in LAN Only mode with Developer Mode on.
+    REFUSED = {84033543: "the printer refused it: turn on LAN Only Mode and Developer Mode on the printer (README)"}
+
+    def _on_answer(self, p):
+        err = p.get("err_code") or (0 if p.get("result", "success").lower() == "success" else -1)
+        if p.get("command") != "print_speed" or not err:
+            return
+        why = self.REFUSED.get(err, f"the printer answered error {err}")
+        self.log(f"printer speed not set: {why}")
+        with self.lock:
+            self.notices.append(notice("Speed not changed", why[0].upper() + why[1:], "hook", self.name, "normal"))
+
+    def _set_online(self, on):
+        with self.lock:
+            if self.online != on:
+                self.online, self.changed = on, True
+
+    def _summary(self):
+        p = self.state
+
+        def num(key):
+            try:
+                return int(round(float(p.get(key) or 0)))
+            except (TypeError, ValueError):
+                return 0
+        job = p.get("subtask_name") or os.path.splitext(os.path.basename(str(p.get("gcode_file") or "")))[0]
+        return {"on": self.online, "name": to_ascii(self.name, 20), "st": to_ascii(p.get("gcode_state"), 9),
+                "job": shorten(job, 32), "pct": num("mc_percent"), "left": num("mc_remaining_time"),
+                "layer": num("layer_num"), "layers": num("total_layer_num"),
+                "noz": num("nozzle_temper"), "nozt": num("nozzle_target_temper"),
+                "bed": num("bed_temper"), "bedt": num("bed_target_temper"),
+                "spd": num("spd_lvl"), "err": num("print_error")}
+
+    def message(self):
+        with self.lock:
+            self.changed = False
+            return {"printer": self._summary()}
+
+    def poll(self):
+        """Notifications for print state changes since the last call."""
+        with self.lock:
+            out, self.notices = self.notices, []
+        return out
+
+    def set_speed(self, level):
+        """Board tapped a speed button: 1 silent, 2 standard, 3 sport, 4 ludicrous."""
+        if level not in self.SPEEDS:
+            return
+        try:
+            self._publish({"print": {"sequence_id": "0", "command": "print_speed", "param": str(level)}})
+            self.log(f"printer speed -> {self.SPEEDS[level]}")
+        except (OSError, ConnectionError) as e:
+            self.log(f"printer speed not set: {e}")
+
+    # --- camera ---
+    def request_snapshot(self):
+        """Board asked for an image: fetch one in the background (one at a time)."""
+        if self.snap_thread is None or not self.snap_thread.is_alive():
+            self.snap_thread = threading.Thread(target=self._snapshot, daemon=True)
+            self.snap_thread.start()
+
+    def _snapshot(self):
+        try:
+            self.snap = (fit_jpeg(self._camera_frame(), 240, 180, self.SNAP_BYTES), None)
+        except subprocess.CalledProcessError:
+            self.snap = (None, "couldn't scale the image (sips)")
+        except Exception as e:
+            self.snap = (None, str(e) or type(e).__name__)
+
+    def _camera_frame(self):
+        """One JPEG from the camera stream: an 80-byte login, then frames of a 16-byte header
+        (payload size first, little-endian) and the JPEG."""
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            raw = socket.create_connection((self.host, self.CAMERA_PORT), timeout=10)
+        except OSError as e:
+            raise RuntimeError(f"camera unreachable: {e.strerror or e}")  # board shows 47 chars
+        with ctx.wrap_socket(raw, server_hostname=self.host) as s:
+            s.sendall(struct.pack("<IIII", 0x40, 0x3000, 0, 0)
+                      + b"bblp".ljust(32, b"\0") + self.code.encode().ljust(32, b"\0"))
+            size = struct.unpack("<I", self._recv(s, 16)[:4])[0]
+            if not 0 < size < 4 * 1024 * 1024:
+                raise RuntimeError("unexpected camera data")
+            jpg = self._recv(s, size)
+        if jpg[:2] != b"\xff\xd8":
+            raise RuntimeError("camera sent no JPEG")
+        return jpg
+
+    def poll_snapshot(self):
+        """(jpeg, None) or (None, error) once a fetch is done, else None."""
+        snap, self.snap = self.snap, None
+        return snap
+
+
+def snapshot_lines(jpg, err, chunk=1400):
+    """Board lines for one camera image: {"snap":{"len":n}} and base64 chunks that fit its line
+    buffer (chunk is a multiple of 4, so each decodes on its own), or {"snap_err":...}."""
+    if err:
+        return [{"snap_err": to_ascii(err, 47)}]
+    b64 = base64.b64encode(jpg).decode()
+    return [{"snap": {"len": len(jpg)}}] + [{"snapd": b64[i:i + chunk]} for i in range(0, len(b64), chunk)]
+
+
+class JiraWork:
+    """Your open Jira issues for the Jira page: a JQL search every `interval` seconds via the Jira
+    Cloud REST API. Auth: your Atlassian e-mail and an API token (id.atlassian.com > Security >
+    API tokens > "Create API token", without scopes). Scoped tokens only work through
+    api.atlassian.com/ex/jira/<cloud id>, not on the site URL used here. Runs in a thread."""
+
+    MAX_ROWS = 7  # what the page shows
+    PRIO = {"highest": 1, "blocker": 1, "critical": 1, "high": 2, "major": 2, "medium": 3,
+            "low": 4, "minor": 4, "lowest": 5, "trivial": 5}
+
+    def __init__(self, site, email, token, jql, interval, log):
+        self.base = (site if "://" in site else "https://" + site).rstrip("/")
+        self.jql, self.interval, self.log = jql, interval, log
+        self.auth = "Basic " + base64.b64encode(f"{email}:{token}".encode()).decode()
+        self.data, self.changed = None, False
+        self.lock = threading.Lock()
+        self.last_error = None
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _post(self, path, body):
+        import urllib.request
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(), method="POST", headers={
+            "Authorization": self.auth, "Accept": "application/json", "Content-Type": "application/json",
+            "User-Agent": "tribebuddy-feeder"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.load(r)
+
+    def _fetch(self):
+        v = self._post("/rest/api/3/search/jql", {"jql": self.jql, "maxResults": self.MAX_ROWS,
+                                                  "fields": ["summary", "status", "priority"]})
+        issues = []
+        for it in v.get("issues", [])[:self.MAX_ROWS]:
+            f = it.get("fields") or {}
+            st = f.get("status") or {}
+            cat = (st.get("statusCategory") or {}).get("key") or "new"
+            prio = str((f.get("priority") or {}).get("name") or "").lower()
+            issues.append({"k": to_ascii(it.get("key"), 15), "s": to_ascii(f.get("summary"), 90),
+                           "st": to_ascii(st.get("name"), 20), "c": "d" if cat == "done" else cat[:1],
+                           "p": self.PRIO.get(prio, 3)})
+        total = len(issues)
+        if v.get("nextPageToken"):  # more than fit: count them (ORDER BY doesn't matter for that)
+            try:
+                jql = re.sub(r"\s+order\s+by\s+.*$", "", self.jql, flags=re.I | re.S)
+                total = int(self._post("/rest/api/3/search/approximate-count", {"jql": jql}).get("count", total))
+            except Exception:
+                pass
+        return {"jira": issues, "jira_total": total}
+
+    def _loop(self):
+        while True:
+            try:
+                data = self._fetch()
+                with self.lock:
+                    self.changed |= data != self.data
+                    self.data = data
+                if self.last_error:
+                    self.log("Jira available again")
+                self.last_error = None
+            except Exception as e:
+                err = f"{e.code} {e.reason}" if hasattr(e, "code") else str(e)
+                hint = {400: " (check --jira-jql)", 401: " (check --jira-email, and use a token without scopes)",
+                        403: " (no access: check the token's account)", 404: " (check --jira-site)"}.get(
+                    getattr(e, "code", None), "")
+                if err != self.last_error:
+                    self.log(f"Jira unavailable: {err}{hint}")
+                    self.last_error = err
+            time.sleep(self.interval)
+
+    def message(self):
+        """{"jira":[...],"jira_total":n}, or None before the first search came back."""
+        with self.lock:
+            self.changed = False
+            return self.data
+
+
+class CalendarFeed:
+    """Your agenda for the Calendar app, and a notification `lead` minutes before each meeting or
+    reminder, from one or more iCalendar (ICS) feeds:
+      * Google Calendar: Settings > (your calendar) > Integrate calendar > "Secret address in
+        iCal format" (one per calendar; Workspace admins can switch this off).
+      * Outlook / Microsoft 365: Settings > Calendar > Shared calendars > Publish > ICS link.
+    Recurring events are expanded for the usual rules (daily, weekly on given days, monthly on a
+    date or a weekday like "2nd Tuesday", yearly) with exceptions and moved occurrences.
+    Cancelled events and ones you declined (matched on `email`) are left out. Tasks (VTODO) with
+    a due time count as reminders. The feed URLs are secrets: they're never logged. Runs in a
+    thread; tick() from the main loop gives the notifications.
+    """
+
+    MAX_ROWS = 7     # what the page shows
+    AHEAD = 8        # days of events to expand
+    WEEKDAYS = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+    # Outlook writes Windows zone names
+    WINDOWS_ZONES = {"W. Europe Standard Time": "Europe/Amsterdam", "Romance Standard Time": "Europe/Paris",
+                     "Central Europe Standard Time": "Europe/Budapest", "GMT Standard Time": "Europe/London",
+                     "UTC": "UTC", "Eastern Standard Time": "America/New_York",
+                     "Pacific Standard Time": "America/Los_Angeles"}
+
+    def __init__(self, urls, email, lead, interval, log):
+        self.urls = [u.replace("webcal://", "https://", 1) for u in urls]
+        self.email = (email or "").lower()
+        self.lead, self.interval, self.log = lead, interval, log
+        self.events = None      # [(start, end, all_day, title, location, is_todo, key)] sorted
+        self.lock = threading.Lock()
+        self.notified = {}      # key -> start timestamp, so each one notifies once
+        self.sent = None        # last board message, to send only changes
+        self.changed = False
+        self.last_error = None
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    # --- reading ICS ---
+    @staticmethod
+    def _lines(text):
+        out = []
+        for raw in text.splitlines():
+            if raw[:1] in (" ", "\t") and out:
+                out[-1] += raw[1:]  # folded continuation line
+            elif raw.strip():
+                out.append(raw)
+        return out
+
+    @staticmethod
+    def _prop(line):
+        """'DTSTART;TZID=Europe/Amsterdam:20261002T093000' -> ('DTSTART', {'TZID': ...}, value)."""
+        quoted, cut = False, len(line)
+        for i, c in enumerate(line):
+            if c == '"':
+                quoted = not quoted
+            elif c == ":" and not quoted:
+                cut = i
+                break
+        head, value = line[:cut], line[cut + 1:]
+        parts = re.findall(r'(?:[^;"]|"[^"]*")+', head)
+        params = {}
+        for part in parts[1:]:
+            k, _, v = part.partition("=")
+            params[k.upper()] = v.strip('"')
+        return (parts[0].upper() if parts else ""), params, value
+
+    @staticmethod
+    def _text(v):
+        return re.sub(r"\\([\\,;nN])", lambda m: "\n" if m.group(1) in "nN" else m.group(1), v)
+
+    def _zone(self, name):
+        try:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(self.WINDOWS_ZONES.get(name, name))
+        except Exception:
+            return None  # unknown: treated as local time
+
+    def _time(self, value, params):
+        """(aware datetime, all_day)."""
+        v = value.strip()
+        if params.get("VALUE") == "DATE" or re.fullmatch(r"\d{8}", v):
+            return datetime.strptime(v[:8], "%Y%m%d").astimezone(), True  # local midnight
+        dt = datetime.strptime(v[:15], "%Y%m%dT%H%M%S")
+        if v.endswith("Z"):
+            return dt.replace(tzinfo=timezone.utc), False
+        tz = self._zone(params["TZID"]) if "TZID" in params else None
+        return (dt.replace(tzinfo=tz) if tz else dt.astimezone()), False  # floating = local
+
+    @staticmethod
+    def _duration(v):
+        m = re.fullmatch(r"([+-])?P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?", v.strip())
+        if not m:
+            return timedelta(0)
+        w, d, h, mi, se = (int(x or 0) for x in m.groups()[1:])
+        td = timedelta(weeks=w, days=d, hours=h, minutes=mi, seconds=se)
+        return -td if m.group(1) == "-" else td
+
+    def _components(self, text):
+        """VEVENT / VTODO property lists; alarms and time zone definitions skipped."""
+        comps, cur, skip = [], None, 0
+        for line in self._lines(text):
+            name, params, value = self._prop(line)
+            if name == "BEGIN":
+                if cur is not None or value.upper() not in ("VEVENT", "VTODO"):
+                    skip += cur is not None or value.upper() != "VCALENDAR"
+                    continue
+                cur = {"_type": value.upper()}
+            elif name == "END":
+                if skip:
+                    skip -= 1
+                elif cur is not None and value.upper() == cur["_type"]:
+                    comps.append(cur)
+                    cur = None
+            elif cur is not None and not skip:
+                cur.setdefault(name, []).append((params, value))
+        return comps
+
+    # --- recurrence ---
+    def _month_days(self, y, m, rule, d0):
+        """Days of month m for a MONTHLY rule: BYDAY like 2TU / -1FR / TU, else BYMONTHDAY, else d0's day."""
+        import calendar
+        last = calendar.monthrange(y, m)[1]
+        days = []
+        for spec in [x for x in rule.get("BYDAY", "").split(",") if x]:
+            n, wd = spec[:-2], self.WEEKDAYS.get(spec[-2:])
+            if wd is None:
+                continue
+            all_wd = [d for d in range(1, last + 1) if datetime(y, m, d).weekday() == wd]
+            if not n or n in ("+", "-"):
+                days += all_wd
+            elif -len(all_wd) <= int(n) <= len(all_wd) and int(n) != 0:
+                days.append(all_wd[int(n) - 1 if int(n) > 0 else int(n)])
+        if not rule.get("BYDAY"):
+            for md in [int(x) for x in rule.get("BYMONTHDAY", "").split(",") if x] or [d0.day]:
+                md = last + 1 + md if md < 0 else md
+                if 1 <= md <= last:
+                    days.append(md)
+        return sorted(set(days))
+
+    def _expand(self, start, rrule, until_window):
+        """Start times from an RRULE, in order, up to until_window."""
+        rule = dict(kv.split("=", 1) for kv in rrule.upper().split(";") if "=" in kv)
+        freq = rule.get("FREQ")
+        interval = max(1, int(rule.get("INTERVAL", "1") or 1))
+        count = int(rule["COUNT"]) if rule.get("COUNT", "").isdigit() else None
+        until = None
+        if rule.get("UNTIL"):
+            try:
+                until, all_day = self._time(rule["UNTIL"], {})
+                if all_day:
+                    until += timedelta(days=1)  # the whole last day counts
+            except ValueError:
+                pass
+        d0, n = start.date(), 0
+        for period in range(100000):
+            if freq == "DAILY":
+                dates = [d0 + timedelta(days=period * interval)]
+            elif freq == "WEEKLY":
+                week = d0 - timedelta(days=d0.weekday()) + timedelta(weeks=period * interval)
+                wds = sorted({self.WEEKDAYS[x[-2:]] for x in rule.get("BYDAY", "").split(",")
+                              if x[-2:] in self.WEEKDAYS}) or [d0.weekday()]
+                dates = [week + timedelta(days=wd) for wd in wds]
+            elif freq == "MONTHLY":
+                y, m = divmod(d0.month - 1 + period * interval, 12)
+                dates = [datetime(d0.year + y, m + 1, d).date()
+                         for d in self._month_days(d0.year + y, m + 1, rule, d0)]
+            elif freq == "YEARLY":
+                try:
+                    dates = [d0.replace(year=d0.year + period * interval)]
+                except ValueError:  # 29 February
+                    dates = []
+            else:
+                yield start
+                return
+            for d in dates:
+                if d < d0:
+                    continue
+                occ = datetime.combine(d, start.time()).replace(tzinfo=start.tzinfo)
+                if (until and occ > until) or occ > until_window:
+                    return
+                n += 1
+                if count and n > count:
+                    return
+                yield occ
+
+    def _declined(self, comp):
+        if not self.email:
+            return False
+        return any(v.lower().endswith(self.email) and p.get("PARTSTAT", "").upper() == "DECLINED"
+                   for p, v in comp.get("ATTENDEE", []))
+
+    def _parse(self, text, now):
+        def first(comp, name, default=None):
+            return comp[name][0] if name in comp else default
+        lo, hi = now - timedelta(days=1), now + timedelta(days=self.AHEAD)
+        out, masters, moved = [], [], {}  # moved: (uid, original start ts) -> override, or None if cancelled
+        for comp in self._components(text):
+            try:
+                is_todo = comp["_type"] == "VTODO"
+                start_p = first(comp, "DUE" if is_todo else "DTSTART")
+                if not start_p:
+                    continue
+                start, all_day = self._time(start_p[1], start_p[0])
+                if is_todo:
+                    status = (first(comp, "STATUS", ({}, ""))[1] or "").upper()
+                    if status in ("COMPLETED", "CANCELLED") or all_day:
+                        continue
+                    end = start
+                elif first(comp, "DTEND"):
+                    end = self._time(first(comp, "DTEND")[1], first(comp, "DTEND")[0])[0]
+                elif first(comp, "DURATION"):
+                    end = start + self._duration(first(comp, "DURATION")[1])
+                else:
+                    end = start + (timedelta(days=1) if all_day else timedelta(0))
+                cancelled = (first(comp, "STATUS", ({}, ""))[1] or "").upper() == "CANCELLED" or self._declined(comp)
+                uid = first(comp, "UID", ({}, ""))[1]
+                ev = {"start": start, "len": end - start, "all_day": all_day, "uid": uid, "todo": is_todo,
+                      "title": self._text(first(comp, "SUMMARY", ({}, ""))[1]) or "(no title)",
+                      "loc": self._text(first(comp, "LOCATION", ({}, ""))[1]).split("\n")[0]}
+                rid = first(comp, "RECURRENCE-ID")
+                if rid:
+                    moved[(uid, self._time(rid[1], rid[0])[0].timestamp())] = None if cancelled else ev
+                elif not cancelled:
+                    ev["rrule"] = first(comp, "RRULE", ({}, ""))[1]
+                    ev["exdates"] = {self._time(x, p)[0].timestamp() for p, v in comp.get("EXDATE", [])
+                                     for x in v.split(",") if x}
+                    masters.append(ev)
+            except (ValueError, KeyError, IndexError):
+                continue  # one malformed entry mustn't lose the rest
+        for ev in masters:
+            starts = self._expand(ev["start"], ev["rrule"], hi) if ev["rrule"] else [ev["start"]]
+            for st in starts:
+                ts = st.timestamp()
+                if ts in ev["exdates"] or (ev["uid"], ts) in moved or st + ev["len"] < lo:
+                    continue
+                out.append(dict(ev, start=st))
+        out += [ev for ev in moved.values() if ev and lo <= ev["start"] + ev["len"] and ev["start"] <= hi]
+        events = []
+        for ev in out:
+            end = ev["start"] + ev["len"]
+            events.append((ev["start"], end, ev["all_day"], to_ascii(ev["title"], 60), to_ascii(ev["loc"], 40),
+                           ev["todo"], f"{ev['uid']}@{ev['start'].timestamp():.0f}"))
+        events.sort(key=lambda e: (e[0], not e[2]))
+        return events
+
+    # --- polling ---
+    def _fetch(self, url):
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "tribebuddy-feeder", "Accept": "text/calendar"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.read().decode("utf-8", errors="replace")
+
+    def _loop(self):
+        while True:
+            events, errors = [], []
+            now = datetime.now().astimezone()
+            for i, url in enumerate(self.urls):
+                try:
+                    events += self._parse(self._fetch(url), now)
+                except Exception as e:  # the URL is a secret: name the feed by its number only
+                    hint = " (that's the public address: use the secret one, with private- in it)" \
+                        if getattr(e, "code", None) == 404 and "/public/" in url else ""
+                    errors.append(f"feed {i + 1}: " + (f"{e.code} {e.reason}" if hasattr(e, "code") else str(e)) + hint)
+            if errors and len(errors) == len(self.urls):
+                events = None  # nothing came in: keep the last good agenda (or none yet), not an empty one
+            err = "; ".join(errors) or None
+            if err != self.last_error:
+                self.log(f"calendar unavailable: {err}" if err else "calendar available again")
+                self.last_error = err
+            if events is not None and self.events is None:
+                self.log(f"calendar loaded: {len(events)} events in the coming {self.AHEAD} days")
+            if events is not None:
+                events.sort(key=lambda e: (e[0], not e[2]))
+                with self.lock:
+                    self.events = events
+            time.sleep(self.interval)
+
+    @staticmethod
+    def _local(dt):
+        """Local seconds since 1970, the board's clock."""
+        return int(dt.timestamp() + dt.astimezone().utcoffset().total_seconds())
+
+    def tick(self):
+        """Notifications for meetings and reminders starting within `lead` minutes; updates the
+        board message when the upcoming list changed."""
+        with self.lock:
+            events = self.events
+        if events is None:
+            return []
+        now = datetime.now().astimezone()
+        out = []
+        for start, end, all_day, title, loc, todo, key in events:
+            if all_day or key in self.notified:
+                continue
+            left = (start - now).total_seconds()
+            if 0 < left <= self.lead * 60 + 30:  # +30 s: the main loop and a minute boundary
+                self.notified[key] = start.timestamp()
+                mins = max(1, round(left / 60))
+                ls, le = start.astimezone(), end.astimezone()  # feeds may give UTC or another zone
+                when = ls.strftime("%H:%M") + (f"-{le.strftime('%H:%M')}" if end > start else "")
+                body = (f"Due {when}" if todo else f"{when}, starts in {mins} min") + (f" - {loc}" if loc else "")
+                out.append(notice(title, body, "hook", "Reminder" if todo else "Calendar", "normal", 60))
+        cutoff = time.time() - 86400
+        self.notified = {k: v for k, v in self.notified.items() if v > cutoff}
+        msg = self.message(now, events)
+        if msg != self.sent:
+            self.changed = True
+        return out
+
+    def message(self, now=None, events=None):
+        """{"cal":[...]}: the next MAX_ROWS events that haven't ended (today's all-day ones too)."""
+        if events is None:
+            with self.lock:
+                events = self.events
+        if events is None:
+            return None
+        now = now or datetime.now().astimezone()
+        rows = []
+        for start, end, all_day, title, loc, todo, key in events:
+            if end <= now and not (end == start and start > now - timedelta(minutes=1)):
+                continue
+            row = {"t": title, "s": self._local(start), "e": self._local(end)}
+            if loc:
+                row["l"] = loc
+            if all_day:
+                row["ad"] = 1
+            if todo:
+                row["r"] = 1
+            rows.append(row)
+            if len(rows) >= self.MAX_ROWS:
+                break
+        return {"cal": rows}
+
+    def mark_sent(self, msg):
+        self.sent, self.changed = msg, False
+
+
+
 class NgrokTunnel:
     """Runs `ngrok http` in front of the webhook so cloud services (Jira, Bitbucket) can reach it.
 
@@ -1035,8 +1776,10 @@ class Approvals:
             except (OSError, ValueError):
                 continue
             self.sent[rid] = r
+            left = APPROVE_WAIT - (time.time() - (r.get("ts") or time.time()))  # the hook's remaining wait
             out.append({"approve": {"id": rid, "app": to_ascii(r.get("project"), 24),
-                                    "tool": to_ascii(r.get("tool"), 23), "detail": to_ascii(r.get("detail"), 159)}})
+                                    "tool": to_ascii(r.get("tool"), 23), "detail": to_ascii(r.get("detail"), 159),
+                                    "ttl": max(1, int(left))}})
         for rid in [k for k in self.sent if k not in ids]:
             del self.sent[rid]
             out.append({"approve_cancel": rid})
@@ -1329,7 +2072,49 @@ def send_command(argv):
     port.close()
 
 
+def _env_int(name):
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return None
+
+
+ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+
+def load_env_file(path=ENV_FILE):
+    """Settings from a .env file next to this script (KEY=value per line, # comments, optional
+    "export " and quotes), so tokens don't have to live in ~/.zshrc. The file wins over variables
+    already set in the environment (e.g. old exports in ~/.zshrc); within the file the last line
+    for a name wins. Returns the names set."""
+    loaded = []
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return loaded
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[7:].strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        elif " #" in value:  # trailing comment on an unquoted value
+            value = value.split(" #", 1)[0].rstrip()
+        if key:
+            os.environ[key] = value
+            if key not in loaded:
+                loaded.append(key)
+    return loaded
+
+
 def main():
+    load_env_file()  # before the option defaults below read the environment
     if len(sys.argv) > 1 and sys.argv[1] == "send":
         send_command(sys.argv[2:])
         return
@@ -1373,7 +2158,7 @@ def main():
     ap.add_argument("--tunnel", choices=["ngrok"], default=os.environ.get("TRIBEBUDDY_TUNNEL") or None,
                     help="make the webhook reachable from the internet (Jira, Bitbucket); needs a token")
     ap.add_argument("--tunnel-domain", default=os.environ.get("TRIBEBUDDY_TUNNEL_DOMAIN"),
-                    help="your ngrok domain, e.g. discharge-gimmick-lard.ngrok-free.dev (Dashboard > Domains)")
+                    help="your ngrok domain, e.g. example-name-here.ngrok-free.dev (Dashboard > Domains)")
     ap.add_argument("--bitbucket-workspace", default=os.environ.get("TRIBEBUDDY_BITBUCKET_WORKSPACE"),
                     help="Bitbucket Cloud workspace to follow pipelines in (e.g. tribeagency)")
     ap.add_argument("--bitbucket-token", default=os.environ.get("TRIBEBUDDY_BITBUCKET_TOKEN"),
@@ -1386,9 +2171,44 @@ def main():
     ap.add_argument("--bitbucket-interval", type=float, default=60, help="seconds between pipeline checks")
     ap.add_argument("--bitbucket-budget", type=int, default=600,
                     help="Bitbucket API requests per hour at most (Bitbucket allows about 1000)")
+    ap.add_argument("--printer-host", default=os.environ.get("TRIBEBUDDY_PRINTER_HOST"),
+                    help="IP address of a Bambu Lab printer on your network (3D Printer app)")
+    ap.add_argument("--printer-serial", default=os.environ.get("TRIBEBUDDY_PRINTER_SERIAL"),
+                    help="the printer's serial number (printer: Settings > Device)")
+    ap.add_argument("--printer-code", default=os.environ.get("TRIBEBUDDY_PRINTER_CODE"),
+                    help="the printer's LAN access code (printer: Settings > WLAN; or TRIBEBUDDY_PRINTER_CODE)")
+    ap.add_argument("--printer-name", default=os.environ.get("TRIBEBUDDY_PRINTER_NAME") or "Bambu P1S",
+                    help="name shown on the display and in notifications")
+    ap.add_argument("--jira-site", default=os.environ.get("TRIBEBUDDY_JIRA_SITE"),
+                    help="your Jira Cloud site, e.g. tribeagency.atlassian.net (Jira app)")
+    ap.add_argument("--jira-email", default=os.environ.get("TRIBEBUDDY_JIRA_EMAIL"),
+                    help="your Atlassian e-mail (default: --bitbucket-email)")
+    ap.add_argument("--jira-token", default=os.environ.get("TRIBEBUDDY_JIRA_TOKEN"),
+                    help="Atlassian API token for Jira (or set TRIBEBUDDY_JIRA_TOKEN)")
+    ap.add_argument("--jira-jql", default=os.environ.get("TRIBEBUDDY_JIRA_JQL")
+                    or "assignee = currentUser() AND statusCategory != Done ORDER BY priority",
+                    help="which issues the Jira app shows")
+    ap.add_argument("--jira-interval", type=float, default=120, help="seconds between Jira searches")
+    ap.add_argument("--calendar-ics", default=os.environ.get("TRIBEBUDDY_CALENDAR_ICS"),
+                    help="iCal (ICS) feed URL(s) for the Calendar app, comma-separated (Google: "
+                         "'Secret address in iCal format'); or set TRIBEBUDDY_CALENDAR_ICS")
+    ap.add_argument("--calendar-email", default=os.environ.get("TRIBEBUDDY_CALENDAR_EMAIL"),
+                    help="your e-mail in invitations, to leave out meetings you declined "
+                         "(default: --jira-email / --bitbucket-email)")
+    ap.add_argument("--calendar-notify", type=int, default=int(os.environ.get("TRIBEBUDDY_CALENDAR_NOTIFY") or 5),
+                    help="minutes before a meeting or reminder to notify (0 = no notifications)")
+    ap.add_argument("--calendar-interval", type=float, default=300, help="seconds between calendar downloads")
+    ap.add_argument("--brightness", type=int, default=_env_int("TRIBEBUDDY_BRIGHTNESS"),
+                    help="display backlight 10-100%% (or TRIBEBUDDY_BRIGHTNESS); unset: set on the display")
+    ap.add_argument("--apps", default=os.environ.get("TRIBEBUDDY_APPS"),
+                    help="apps on the home screen, comma-separated: dev,printer,jira,calendar "
+                         "(or TRIBEBUDDY_APPS); unset: chosen on the display")
+    ap.add_argument("--contrast", choices=["high", "standard"], default=os.environ.get("TRIBEBUDDY_CONTRAST") or None,
+                    help="display palette (or TRIBEBUDDY_CONTRAST); unset: chosen on the display")
     ap.add_argument("--approve", action="store_true",
+                    default=os.environ.get("TRIBEBUDDY_APPROVE", "").lower() in ("1", "true", "yes", "on"),
                     help="let Claude Code permission requests be allowed/denied by tapping the display "
-                         "(also needs install-hooks --approve)")
+                         "(also needs install-hooks --approve; or TRIBEBUDDY_APPROVE=1)")
     ap.add_argument("--no-limits", action="store_true",
                     help="don't show plan limits (skips reading Claude Code's login token)")
     args = ap.parse_args()
@@ -1407,6 +2227,7 @@ def main():
 
     def wait_reply():
         """The board answers every line with {"ok":...}; skip anything else (e.g. boot text)."""
+        nonlocal settings_sent
         end = time.monotonic() + REPLY_TIMEOUT
         while time.monotonic() < end:
             raw = port.readline().decode(errors="replace").strip()
@@ -1415,18 +2236,25 @@ def main():
             board_event(raw)
             if '"ready"' in raw:
                 log("board restarted")
+                settings_sent = False
         return None
 
     def board_event(raw):
-        """Lines the board sends by itself: {"event":"approve","id":...,"allow":true}."""
-        if not raw.startswith('{"event"') or not approvals:
+        """Lines the board sends by itself: {"event":"approve","id":...,"allow":true},
+        {"event":"speed","level":3}, {"event":"snapshot"}."""
+        if not raw.startswith('{"event"'):
             return
         try:
             ev = json.loads(raw)
         except ValueError:
             return
-        if ev.get("event") == "approve" and isinstance(ev.get("id"), str):
+        kind = ev.get("event")
+        if kind == "approve" and approvals and isinstance(ev.get("id"), str):
             approvals.decide(ev["id"], ev.get("allow") is True)
+        elif kind == "speed" and printer and isinstance(ev.get("level"), int):
+            printer.set_speed(ev["level"])
+        elif kind == "snapshot" and printer:
+            printer.request_snapshot()
 
     def read_events():
         """Taps arrive between our own lines: read whatever the board sent meanwhile."""
@@ -1480,7 +2308,7 @@ def main():
                 failed += 1
                 continue
             try:
-                port.reset_input_buffer()
+                read_events()  # instead of discarding stale input: it may hold a tap
                 port.write(line.encode() + b"\n")
                 port.flush()
                 reply = wait_reply()
@@ -1524,6 +2352,34 @@ def main():
                                        branches, max(30.0, args.bitbucket_interval), log,
                                        budget=max(60, args.bitbucket_budget))
         log(f"following Bitbucket pipelines in {args.bitbucket_workspace} on {', '.join(branches)}")
+    printer = None
+    if args.printer_host:
+        if not (args.printer_serial and args.printer_code):
+            sys.exit("--printer-host needs --printer-serial and --printer-code (or TRIBEBUDDY_PRINTER_SERIAL/_CODE)")
+        printer = BambuPrinter(args.printer_host, args.printer_serial.strip(), args.printer_code.strip(),
+                               args.printer_name, log)
+        log(f"following printer {args.printer_name} at {args.printer_host}")
+    jira = None
+    if args.jira_site:
+        email = args.jira_email or args.bitbucket_email
+        if not (email and args.jira_token):
+            sys.exit("--jira-site needs --jira-email (or --bitbucket-email) and --jira-token")
+        jira = JiraWork(args.jira_site, email, args.jira_token, args.jira_jql, max(30.0, args.jira_interval), log)
+        log(f"following Jira on {args.jira_site}: {args.jira_jql}")
+    calendar = None
+    if args.calendar_ics:
+        urls = [u for u in re.split(r"[\s,]+", args.calendar_ics) if u]
+        calendar = CalendarFeed(urls, args.calendar_email or args.jira_email or args.bitbucket_email,
+                                max(0, args.calendar_notify), max(60.0, args.calendar_interval), log)
+        log(f"following {len(urls)} calendar feed(s); notifying {args.calendar_notify} min before")
+    settings = {}  # sent to the board once per connection; what's unset stays the display's choice
+    if args.brightness is not None:
+        settings["bright"] = max(10, min(100, args.brightness))
+    if args.apps:
+        settings["apps"] = args.apps
+    if args.contrast:
+        settings["contrast"] = args.contrast
+    settings_sent = False
     tunnel = None
     if args.tunnel:
         if not args.webhook_port:
@@ -1546,6 +2402,7 @@ def main():
 
     approvals = Approvals(log) if args.approve else None
     next_scan = 0.0
+    printer_sent, last_snap_error = 0.0, None
     waiting = False
     while True:
         if tunnel:
@@ -1562,13 +2419,15 @@ def main():
                 time.sleep(5)
                 continue
             next_scan = 0.0  # fresh connection (or a restarted board): send everything now
+            settings_sent = False
         read_events()
         if approvals:
             for m in approvals.poll():  # one at a time: a rejected one goes back to the terminal
                 if send([m]) and "approve" in m:
                     approvals.unavailable(m["approve"]["id"])
         notes = spool.poll() + (desktop.poll() if desktop else []) + (webhook.poll() if webhook else []) \
-            + (pipelines.poll() if pipelines else [])
+            + (pipelines.poll() if pipelines else []) + (printer.poll() if printer else []) \
+            + (calendar.tick() if calendar and args.calendar_notify else [])
         if notes:
             failed = send(notes)
             if not args.dry_run:
@@ -1581,6 +2440,28 @@ def main():
             send([sessions.message()])  # a session changed state: show it now
         if pipelines and pipelines.changed and time.monotonic() < next_scan:
             send([pipelines.message()])
+        if printer and printer.changed and time.monotonic() < next_scan \
+                and time.monotonic() - printer_sent >= PRINTER_GAP:
+            send([printer.message()])
+            printer_sent = time.monotonic()
+        if jira and jira.changed and time.monotonic() < next_scan:
+            send([jira.message()])
+        if calendar and not args.calendar_notify:
+            calendar.tick()  # still keeps the agenda up to date
+        if calendar and calendar.changed and time.monotonic() < next_scan:
+            m = calendar.message()
+            if m and not send([m]):
+                calendar.mark_sent(m)
+        if settings and not settings_sent and (port is not None or args.dry_run):
+            settings_sent = not send([{"settings": settings}])
+        snap = printer.poll_snapshot() if printer else None
+        if snap:
+            jpg, err = snap
+            if send(snapshot_lines(jpg, err)) and not args.dry_run:
+                log("camera image not delivered")
+            elif err and err != last_snap_error:
+                log(f"camera: {err}")
+            last_snap_error = err
         lim = limits.message() if limits and limits.poll(wait=args.once) else None
         if lim and time.monotonic() < next_scan:
             send([lim])  # new numbers between usage scans
@@ -1590,9 +2471,15 @@ def main():
         if time.monotonic() >= next_scan:
             usage.scan(roots)
             msgs = usage.messages(n_days, args.limit) + [sessions.message()] \
-                + ([pipelines.message()] if pipelines else [])
+                + ([pipelines.message()] if pipelines else []) + ([printer.message()] if printer else []) \
+                + [m for m in [jira.message() if jira else None] if m]
+            cal_msg = calendar.message() if calendar else None
+            if cal_msg:
+                msgs.append(cal_msg)
             lim = limits.message() if limits else None
             failed = send(msgs + ([lim] if lim else []))  # limits resent too, e.g. after a replug
+            if cal_msg and not failed:
+                calendar.mark_sent(cal_msg)
             if not args.dry_run:
                 o = msgs[0]
                 tok = o["in"] + o["out"] + o["cw"]
