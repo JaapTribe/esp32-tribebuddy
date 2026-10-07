@@ -2404,6 +2404,12 @@ def main():
     next_scan = 0.0
     printer_sent, last_snap_error = 0.0, None
     waiting = False
+
+    def poll_notes():
+        return spool.poll() + (desktop.poll() if desktop else []) + (webhook.poll() if webhook else []) \
+            + (pipelines.poll() if pipelines else []) + (printer.poll() if printer else []) \
+            + (calendar.tick() if calendar and args.calendar_notify else [])
+
     while True:
         if tunnel:
             tunnel.tick()
@@ -2414,6 +2420,9 @@ def main():
         if not args.dry_run and port is None:
             port = connect()
             if port is None:
+                dropped = poll_notes()  # drop them: replaying a weekend's backlog on reconnect is spam
+                if dropped:
+                    log(f"no board: dropped {len(dropped)} notification(s)")
                 if args.once:
                     sys.exit(1)
                 time.sleep(5)
@@ -2425,9 +2434,7 @@ def main():
             for m in approvals.poll():  # one at a time: a rejected one goes back to the terminal
                 if send([m]) and "approve" in m:
                     approvals.unavailable(m["approve"]["id"])
-        notes = spool.poll() + (desktop.poll() if desktop else []) + (webhook.poll() if webhook else []) \
-            + (pipelines.poll() if pipelines else []) + (printer.poll() if printer else []) \
-            + (calendar.tick() if calendar and args.calendar_notify else [])
+        notes = poll_notes()
         if notes:
             failed = send(notes)
             if not args.dry_run:
