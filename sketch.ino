@@ -744,7 +744,7 @@ struct Recent {
   bool unread;       // not seen on the recent page yet
   unsigned long at;  // millis() when it came in
 };
-const int MAX_RECENT = 7;  // what fits on the page
+const int MAX_RECENT = 6;  // what fits on the page, leaving a strip below to turn the page
 Recent recent[MAX_RECENT];
 int nRecent = 0;
 int openRecent = -1;  // the one shown full screen after a tap on its row, -1 = the list
@@ -845,6 +845,7 @@ void drawRecentStatic() {
     drawWrapped(18, y + 10, 212, 1, 18, r.title[0] ? r.title : r.body);  // one line, "..." when longer
     if (i < nRecent - 1) tft.drawFastHLine(10, y + RC_STEP - 5, 220, C_PANEL);
   }
+  if (touchCal.ok || touchType == TOUCH_FT6206) label(10, 308, "tap here for the next page >");
 }
 
 // Only the ages change on their own; redrawn every second from drawStatus.
